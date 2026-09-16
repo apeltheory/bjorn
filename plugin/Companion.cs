@@ -526,7 +526,7 @@ public class Companion : BaseUnityPlugin {
         foreach (var lead in new[] { "how do i make ", "how do you make ", "how is ", "how do i craft ",
                                      "what do i need for ", "what do you need for ", "what does it take for ",
                                      "recipe for ", "whats in ", "what's in ", "what makes " })
-            if (Prefixed(simple, order, lead, out rest) && Recipes(rest)) return;
+            if (Prefixed(simple, order, lead, out rest) && Recipes(speaker, rest)) return;
         if (Prefixed(simple, order, "remember this as ", out rest) && RememberPlace(rest)) return;
         if (Prefixed(simple, order, "remember this place as ", out rest) && RememberPlace(rest)) return;
         if (Prefixed(simple, order, "remember here as ", out rest) && RememberPlace(rest)) return;
@@ -1170,13 +1170,7 @@ public class Companion : BaseUnityPlugin {
     // Recipe questions are answered from ObjectDB, not from anything remembered. That
     // is the installed game's own data, so it is exactly right for this version and
     // any mods, costs no API call, and works with the planner down.
-    bool Recipes(string wanted) {
-        string key = Key(Bare(wanted) ?? "");
-        if (key.Length < 3 || !ObjectDB.instance) return false;
-        var known = ObjectDB.instance.m_recipes.Where(r => r && r.m_item && r.m_enabled).ToList();
-        var recipe = known.FirstOrDefault(r => Key(RecipeName(r)) == key)
-                  ?? known.FirstOrDefault(r => KeyMatches(RecipeName(r), key));
-        if (recipe == null) return false;
+    void TellRecipe(Recipe recipe) {
         string name = Localization.instance.Localize(recipe.m_item.m_itemData.m_shared.m_name);
         var parts = recipe.m_resources.Where(x => x.m_resItem)
             .Select(x => x.m_amount + " " + Localization.instance.Localize(x.m_resItem.m_itemData.m_shared.m_name)).ToList();
@@ -1186,6 +1180,25 @@ public class Companion : BaseUnityPlugin {
             ? made + " takes nothing I can name."
             : made + ": " + string.Join(", ", parts) +
               (station ? ", at a " + Localization.instance.Localize(station.m_name) + "." : ", by hand."));
+    }
+    bool Recipes(Player speaker, string wanted) {
+        string key = Key(Bare(wanted) ?? "");
+        if (key.Length < 3 || !ObjectDB.instance) return false;
+        var known = ObjectDB.instance.m_recipes.Where(r => r && r.m_item && r.m_enabled).ToList();
+        var exact = known.FirstOrDefault(r => Key(RecipeName(r)) == key);
+        if (exact != null) { TellRecipe(exact); return true; }
+        // "spear" is four different spears. Rather than answering about whichever
+        // happened to be first in the table, name them and wait - the reply does not
+        // need his name in front of it.
+        var loose = known.Where(r => KeyMatches(RecipeName(r), key))
+            .GroupBy(RecipeName).Select(g => g.First()).Take(5).ToList();
+        if (loose.Count == 0) return false;
+        if (loose.Count == 1) { TellRecipe(loose[0]); return true; }
+        var names = loose.Select(RecipeName).ToArray();
+        AskFor(speaker, "Which — " + string.Join(", ", names) + "?", names, pick => {
+            var chosen = loose.FirstOrDefault(r => RecipeName(r) == pick);
+            if (chosen != null) TellRecipe(chosen);
+        });
         return true;
     }
     static string RecipeName(Recipe recipe) {
@@ -2111,7 +2124,7 @@ public class Companion : BaseUnityPlugin {
                 case "self_test": SelfTest(); break;
                 case "survey": Survey(true); break;
                 case "tend": if (!Tend(item)) Say("I see no " + item + " to tend."); break;
-                case "recipe": if (!Recipes(item ?? decision.reply)) Say("I know no recipe by that name."); break;
+                case "recipe": if (!Recipes(speaker, item ?? decision.reply)) Say("I know no recipe by that name."); break;
                 case "camp": CampReport(null); break;
                 case "remember_home": RememberPlace(item ?? "home"); break;
                 case "go_home": if (item == null) GoHome(); else if (!GoToPlace(item)) Say("I know no place called that."); break;
