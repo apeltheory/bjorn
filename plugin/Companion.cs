@@ -46,7 +46,7 @@ public class Companion : BaseUnityPlugin {
     Character hurtBy;      // Whoever last actually landed a hit on him.
     float hurtAt;
     Vector3 fightFrom;     // Where a self-defence fight started, so he does not chase far.
-    float threatScan, lastShout, grazeCheck, morselScan, lastBeg, morselAt, hungrySince;
+    float threatScan, lastShout, grazeCheck, morselScan, lastBeg, morselAt, hungrySince, mendRefused;
     int begged;
     ItemDrop morsel;   // Food on the ground he is walking over to collect.
     ItemDrop salvage;  // Anything on the ground he is collecting while acting as a mule.
@@ -583,7 +583,7 @@ public class Companion : BaseUnityPlugin {
             ? "I know this camp: " + Mathf.RoundToInt(campSpan * 2f) + " paces across, centre " + Mathf.RoundToInt(Vector3.Distance(here, camp)) + " paces " + Compass(camp - here) + "."
             : "I've not surveyed a camp. Say 'learn the camp' standing in it.");
         int chests = Nearby<Container>(here, 8f).Count(IsChest);
-        var station = me.GetCurrentCraftingStation();
+        var station = StationAt(here, 2.5f);
         Say("Around me: " + (chests == 0 ? "no chest" : chests + (chests == 1 ? " chest" : " chests")) + ", " +
             (station ? Localization.instance.Localize(station.m_name) + " in range" : "no station in range") + ", " +
             Nearby<ItemDrop>(here, 12f).Count(d => !d.IsPiece()) + " items on the ground.");
@@ -864,11 +864,29 @@ public class Companion : BaseUnityPlugin {
         if (open == wantOpen) { Say(open ? "The door already stands open." : "The door is already shut."); return; }
         Say(door.Interact(me, false, false) ? (wantOpen ? "Opened." : "Shut.") : "That door will not move for me.");
     }
-    void Repair() {
+    // Valheim only sets Player.m_currentStation from CraftingStation.Interact, which
+    // also opens the crafting window, and Player.UpdateStations clears it again on the
+    // next frame that window is not visible. A bot never opens it, so
+    // GetCurrentCraftingStation() reads null while standing on a forge. Find the
+    // station directly instead. CraftingStation.m_useDistance is 2 metres.
+    CraftingStation StationAt(Vector3 where, float radius) {
         var me = Player.m_localPlayer;
-        var station = me.GetCurrentCraftingStation();
-        if (!station) { Say("I must stand at a workbench or forge to mend anything."); return; }
-        if (!station.CheckUsable(me, false)) { Say("That station will not serve me."); return; }
+        return Nearby<CraftingStation>(where, radius)
+            .Where(s => s && s.CheckUsable(me, false))
+            .OrderBy(s => Vector3.Distance(s.transform.position, where)).FirstOrDefault();
+    }
+    // Scanning the loaded scene is not free and Drive asks every tick, so cache it.
+    float stationScan;
+    CraftingStation stationNear;
+    CraftingStation StationNear(Vector3 where, float radius) {
+        if (Time.time < stationScan) return stationNear;
+        stationScan = Time.time + 0.5f;
+        return stationNear = StationAt(where, radius);
+    }
+    // Durability is written directly, so repairing needs no engine gate - only the
+    // right station to be standing there.
+    int Mend(CraftingStation station) {
+        var me = Player.m_localPlayer;
         var worn = new List<ItemDrop.ItemData>();
         me.GetInventory().GetWornItems(worn);
         int mended = 0;
@@ -878,6 +896,12 @@ public class Companion : BaseUnityPlugin {
             item.m_durability = item.GetMaxDurability();
             mended++;
         }
+        return mended;
+    }
+    void Repair() {
+        var station = StationAt(Player.m_localPlayer.transform.position, 2.5f);
+        if (!station) { Say("I must stand at a workbench or forge to mend anything."); return; }
+        int mended = Mend(station);
         Say(mended == 0 ? "Nothing here needs mending." : "Mended " + mended + (mended == 1 ? " piece" : " pieces") + " of gear.");
     }
     // Mirrors Valheim's own repair test: the station must be the one the recipe
@@ -911,8 +935,12 @@ public class Companion : BaseUnityPlugin {
         var recipe = usable.FirstOrDefault(r => Key(RecipeName(r)) == key) ?? usable.FirstOrDefault(r => KeyMatches(RecipeName(r), key));
         if (recipe == null) return false;
         string name = Localization.instance.Localize(recipe.m_item.m_itemData.m_shared.m_name);
-        var station = recipe.GetRequiredStation(1);
-        if (station && me.GetCurrentCraftingStation() == null) { Say("I must stand at a " + Localization.instance.Localize(station.m_name) + " to make " + name + "."); return true; }
+        var needed = recipe.GetRequiredStation(1);
+        // HaveRequirements checks m_currentStation, which is null for a bot, so set it
+        // for the duration of the craft. UpdateStations clears it again next frame.
+        var standing = needed ? StationAt(me.transform.position, 2.5f) : null;
+        if (needed && !standing) { Say("I must stand at a " + Localization.instance.Localize(needed.m_name) + " to make " + name + "."); return true; }
+        if (standing) me.SetCraftingStation(standing);
         long crafter = Game.instance.GetPlayerProfile().GetPlayerID();
         int made = 0;
         bool full = false;
@@ -1045,6 +1073,7 @@ public class Companion : BaseUnityPlugin {
         morsel = Nearby<ItemDrop>(player.transform.position, 12f)
             .Where(d => IsLive(d) && !d.IsPiece() && d.m_itemData?.m_shared != null &&
                         !skippedDrops.Contains(d.GetInstanceID()) &&
+                        player.GetInventory().CanAddItem(d.m_itemData) &&
                         d.m_itemData.m_shared.m_food > 0f && player.CanEat(d.m_itemData, false))
             .OrderBy(d => Vector3.Distance(d.transform.position, player.transform.position)).FirstOrDefault();
         if (!morsel) { Beg(player); return false; }
@@ -1499,12 +1528,16 @@ public class Companion : BaseUnityPlugin {
         Vector3 where;
         // A station he is already standing at beats any walk. Otherwise head for a
         // real station if one is loaded, then the surveyed camp, then a waypoint.
-        var station = Nearest<CraftingStation>(me.transform.position, 60f);
-        if (me.GetCurrentCraftingStation() != null) where = me.transform.position;
+        var station = StationAt(me.transform.position, 60f);
+        if (StationNear(me.transform.position, 2.5f)) where = me.transform.position;
         else if (station) where = station.transform.position;
         else if (campKnown) where = camp;
         else if (!places.TryGetValue("workbench", out where) && !places.TryGetValue("home", out where)) {
-            Say("My " + name + " is nearly spent and I know no bench to mend it at. Say 'learn the camp' in your base.");
+            // Said once, not once per physics tick for the rest of the job.
+            if (Time.time - mendRefused > 60f) {
+                mendRefused = Time.time;
+                Say("My " + name + " is nearly spent and I know no bench to mend it at. Say 'learn the camp' in your base.");
+            }
             return false;
         }
         errand = job;
@@ -1516,8 +1549,14 @@ public class Companion : BaseUnityPlugin {
         return true;
     }
     void Mend(Player player) {
-        if (player.GetCurrentCraftingStation() != null) { Repair(); ResumeSweep(player); return; }
-        var station = Nearest<CraftingStation>(player.transform.position, 15f);
+        var standing = StationAt(player.transform.position, 2.5f);
+        if (standing) {
+            int mended = Mend(standing);
+            Say(mended == 0 ? "Nothing of mine needed mending after all." : "Mended " + mended + ". Back to it.");
+            ResumeSweep(player);
+            return;
+        }
+        var station = StationAt(player.transform.position, 15f);
         if (station && Vector3.Distance(station.transform.position, player.transform.position) > 1.8f) {
             destination = station.transform.position; reachedAt = 0f;
             return;
@@ -1678,7 +1717,7 @@ public class Companion : BaseUnityPlugin {
             haveBed = TryParsePosition(bedPosition.Value, out _),
             places = places.Keys.ToArray(),
             chestNearby = Nearby<Container>(me.transform.position, 5f).Any(IsChest),
-            stationNearby = me.GetCurrentCraftingStation() != null,
+            stationNearby = StationNear(me.transform.position, 2.5f) != null,
             inventory = me.GetInventory().GetAllItems().Take(40).Select(i => new { name = Localization.instance.Localize(i.m_shared.m_name), count = i.m_stack })
         }});
         using (var request = new UnityWebRequest("http://127.0.0.1:8765/decide", "POST")) {
@@ -1767,8 +1806,9 @@ public class Companion : BaseUnityPlugin {
                 goal = destination;
                 return true;
             case Job.Mend:
-                // Mend walks to a station, then closes the last stride onto it.
-                goal = destination; arrival = 1.8f;
+                // Deliberately tighter than the 1.8 m retarget test inside Mend, or he
+                // arrives, is told he is still too far, retargets, and never closes.
+                goal = destination; arrival = 1.5f;
                 return true;
             case Job.Resume:
                 // A mule run ends back at whoever he is carrying for, not at a spot.
@@ -2093,10 +2133,11 @@ public class Companion : BaseUnityPlugin {
         Graze(player);
         if (Threatened(player)) { Engage(player); return; }
         if (Fleeing(player)) { Flee(player); return; }
-        // Fetching a dropped meal never interrupts a fight, and never derails an
-        // errand he is already part-way through.
-        if (errand == Job.None && job != Job.Deliver && job != Job.Grave && Peckish(player)) { TakeMorsel(player); return; }
-        if (job == Job.None) return;
+        if (job == Job.None) {
+            // Idle: nothing to detour from, so a meal is all that is left to want.
+            if (Peckish(player)) TakeMorsel(player);
+            return;
+        }
         // Guard duty holds its post while hurt; every other job breaks off.
         if (job != Job.Patrol && job != Job.Escort && player.GetHealth() < player.GetMaxHealth() * 0.3f) { Halt("I must stop here. I cannot go on safely."); return; }
         // Swimming is fine; drowning is not. Let him cross water, and only break off
@@ -2111,6 +2152,9 @@ public class Companion : BaseUnityPlugin {
             if (Loaded(player) && StartHaul()) return;
             if (Blunt(ToolFor(job)) && StartMend(ToolFor(job))) return;
         }
+        // Below the detours, so a full pack is emptied before he tries to pick up a
+        // meal he has no room for, and never while he is part-way through an errand.
+        if (errand == Job.None && job != Job.Deliver && job != Job.Grave && Peckish(player)) { TakeMorsel(player); return; }
         if (Scavenging(player)) { Scavenge(player); return; }
         if (!NextGoal(player, out Vector3 goal, out float arrival)) return;
         if ((job == Job.Follow || job == Job.Escort) && target) {
