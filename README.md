@@ -262,7 +262,28 @@ the geometry:
 steering: 0=wall 1.8; -30=slope 47; 30=blocked at chest, rise 0.9 (a door is within reach and did not open)
 ```
 
-Read them with `./scripts/bugs.sh`, `./scripts/bugs.sh 5`, or `./scripts/bugs.sh all`.
+He also records his **own** failures, unprompted. Every time he gives up — no way through,
+wedged, lost you, leash broke, gave up on a tree, could not reach a foe, bench unreachable —
+he appends a line with the same geometry, deduplicated to one per failure per five-metre
+square per minute so a wedged bot cannot flood the file.
+
+```
+-- 19:30:01 no way through | job=Home | at=286,40,311 | hands=Stone axe | probes=0=wall 1.8; -30=slope 47
+```
+
+That turns anecdote into a ranked list:
+
+```sh
+./scripts/bugs.sh              # what he gives up on most, and where
+./scripts/bugs.sh reports      # the ones filed by hand
+./scripts/bugs.sh fails 30     # raw failure lines
+./scripts/bugs.sh clear
+```
+
+The summary clusters failures by kind and by location to the nearest ten metres, so a
+patch of terrain that defeats him repeatedly shows up as a coordinate rather than a
+feeling. It also counts how many failures happened with `hands=EMPTY`, which is its own
+distinct bug.
 
 ## When he does not understand
 

@@ -340,6 +340,35 @@ public class Companion : BaseUnityPlugin {
         Say(path != null ? "Noted. I've written down where I was and what I could see." : "Noted, though I could not write it down.");
         return true;
     }
+    // He already knows when he has failed - he says so out loud. Recording those
+    // moments beats a snapshot on a timer, which would mostly catch him walking along
+    // quite happily.
+    readonly Dictionary<string, float> stumbles = new Dictionary<string, float>();
+    void Stumble(string what) {
+        var me = Player.m_localPlayer;
+        Vector3 at = me ? me.transform.position : Vector3.zero;
+        // One line per distinct failure per five-metre square per minute. A bot wedged
+        // in a corner would otherwise write the same line fifty times a second.
+        string key = what + "@" + Mathf.RoundToInt(at.x / 5f) + "," + Mathf.RoundToInt(at.z / 5f);
+        if (stumbles.TryGetValue(key, out float last) && Time.time - last < 60f) return;
+        stumbles[key] = Time.time;
+        string line = "-- " + DateTime.Now.ToString("HH:mm:ss") + " " + what +
+                      " | job=" + job + (errand != Job.None ? "/" + errand : "") +
+                      " | at=" + Vector3ToConfig(at);
+        if (me) {
+            Vector3 facing = target ? target.transform.position - at
+                : (destination != Vector3.zero ? destination - at : me.transform.forward);
+            facing.y = 0f;
+            if (facing.sqrMagnitude < 0.01f) facing = Vector3.forward;
+            var held = me.GetCurrentWeapon();
+            line += " | hands=" + (held != null ? Localization.instance.Localize(held.m_shared.m_name) : "EMPTY") +
+                    " | probes=" + Probes(at, facing.normalized,
+                        LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain"));
+        }
+        try { File.AppendAllText(Path.Combine(Path.GetDirectoryName(tokenFile.Value), "reports.log"), line + "\n"); }
+        catch { }
+        Logger.LogInfo(line);
+    }
     internal void Receive(GameObject source, long senderId, string text) {
         var me = Player.m_localPlayer;
         if (text == null) return;
@@ -1714,7 +1743,7 @@ public class Companion : BaseUnityPlugin {
         SwingAt(player, sweepTarget);
     }
     void Skip() {
-        if (sweepTarget) visited.Add(sweepTarget.GetInstanceID());
+        if (sweepTarget) { Stumble("gave up on " + sweepTarget.name); visited.Add(sweepTarget.GetInstanceID()); }
         sweepTarget = null; reachedAt = 0f; stuckTime = 0;
     }
     // A Pickable without an item prefab throws inside GetHoverName; treat it as unnamed.
@@ -1814,6 +1843,7 @@ public class Companion : BaseUnityPlugin {
         }
         if (reachedAt == 0f) reachedAt = Time.time;
         if (Time.time - reachedAt > 8f)
+            Stumble(station ? "bench unreachable" : "no bench where I went");
             Halt(station ? "I'm at the bench but can't get close enough to work." : "I came to mend, but there's no station here.");
     }
     void ResumeSweep(Player player) {
@@ -2045,7 +2075,7 @@ public class Companion : BaseUnityPlugin {
             case Job.Come:
             case Job.Escort:
             case Job.Mule:
-                if (!target) { Halt("I have lost you."); return false; }
+                if (!target) { Stumble("lost the player"); Halt("I have lost you."); return false; }
                 goal = target.transform.position;
                 arrival = job == Job.Follow || job == Job.Come ? 3f : 4f;
                 return true;
@@ -2388,7 +2418,7 @@ public class Companion : BaseUnityPlugin {
         // back up and freeze the job he was doing.
         if (step != Step.Moving) {
             unreachable.Add(threat.GetInstanceID());
-            Logger.LogInfo("Cannot reach " + Localization.instance.Localize(threat.m_name) + "; leaving it.");
+            Stumble("cannot reach " + Localization.instance.Localize(threat.m_name));
             threat = null; stuckTime = 0;
         }
     }
@@ -2417,7 +2447,7 @@ public class Companion : BaseUnityPlugin {
             if (dryGround != Vector3.zero) StepToward(player, dryGround, 2.5f);
             return;
         }
-        if (job != Job.Patrol && job != Job.Escort && player.GetHealth() < player.GetMaxHealth() * 0.3f) { Halt("I must stop here. I cannot go on safely."); return; }
+        if (job != Job.Patrol && job != Job.Escort && player.GetHealth() < player.GetMaxHealth() * 0.3f) { Stumble("hurt, broke off"); Halt("I must stop here. I cannot go on safely."); return; }
         if (IsSweep && Time.time > sweepUntil) { FinishSweep("I have spent long enough at it."); return; }
         // Checked before picking a target: a full pack or a blunt tool means the next
         // thing to do is the errand, not another tree.
@@ -2435,9 +2465,10 @@ public class Companion : BaseUnityPlugin {
             // Only genuine distance ends a follow. A height gap is a staircase or a
             // boulder far more often than it is somewhere he cannot go, so he walks
             // to below you and lets the stuck check decide.
-            if (gap.magnitude > 35 || Math.Abs(gap.y) > 20) { Halt("You are beyond my reach. Return for me."); return; }
+            if (gap.magnitude > 35 || Math.Abs(gap.y) > 20) { Stumble("leash broke"); Halt("You are beyond my reach. Return for me."); return; }
         }
-        switch (StepToward(player, goal, arrival)) {
+        var step = StepToward(player, goal, arrival);
+        switch (step) {
             case Step.Arrived: Arrive(player); return;
             case Step.Moving: return;
             default:
@@ -2449,11 +2480,14 @@ public class Companion : BaseUnityPlugin {
                     // rather than spinning through the ring forever.
                     if (Time.time < postUntil) return;
                     postUntil = Time.time + 1f;
-                    if (++postsFailed >= 8) { Halt("I cannot walk the bounds from here. Set me somewhere clearer."); return; }
+                    if (++postsFailed >= 8) { Stumble("patrol boxed in"); Halt("I cannot walk the bounds from here. Set me somewhere clearer."); return; }
                     NextPost(); stuckTime = 0;
                     return;
                 }
-                Halt("The way is blocked. I will wait here.");
+                // Wedged and shoving is a different failure from having nowhere to go,
+                // and they want different fixes, so say which.
+                Stumble(step == Step.Stuck ? "wedged" : "no way through");
+                Halt(step == Step.Stuck ? "I'm wedged fast here. I'll wait." : "The way is blocked. I will wait here.");
                 return;
         }
     }

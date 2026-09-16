@@ -69,11 +69,19 @@ needs no name prefix, and works in manual mode. Each one appends a snapshot to
 health, stamina, food, what is in his hands and his pack, what is around him, and what
 all twelve steering probes saw at that instant.
 
+He also records his own failures without being asked — every give-up, with the same
+geometry, deduplicated per spot per minute.
+
 ```sh
-./scripts/bugs.sh          # the most recent report
-./scripts/bugs.sh 5        # the last five
+./scripts/bugs.sh          # ranked: what he gives up on, and where
+./scripts/bugs.sh reports  # filed by hand
+./scripts/bugs.sh fails 30 # raw failure lines
 ./scripts/bugs.sh all
 ```
+
+**Start a session with `./scripts/bugs.sh`.** It is the cheapest way to find what is
+actually worth fixing, and the location clustering points at the specific terrain rather
+than a general complaint.
 
 Read the report before theorising. The `steering:` line is usually the answer when the
 complaint is about getting stuck, and `hands: EMPTY` explains most "he did nothing".
