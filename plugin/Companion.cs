@@ -26,7 +26,7 @@ public class Companion : BaseUnityPlugin {
     // handing the walk back a stuck clock it had not earned, and a retargeted sweep
     // inherited the last target's. One record per caller, and the fourteen hand-written
     // resets that used to paper over it are gone.
-    enum Lane { Job, Fight, Flee, Pickup }
+    enum Lane { Job, Fight, Flee, Pickup, Backoff }
     class Steering {
         public float touched;        // when this lane last ran
         public Vector3 goal;         // what it was walking to
@@ -36,7 +36,9 @@ public class Companion : BaseUnityPlugin {
         public Vector3 avoidDirection;
         public bool sprinting;       // held across ticks, for hysteresis
     }
-    readonly Steering[] lanes = { new Steering(), new Steering(), new Steering(), new Steering() };
+    // Positional, so a new Lane needs a new record here - the mismatch would be an
+    // IndexOutOfRange at runtime, not a compile error.
+    readonly Steering[] lanes = { new Steering(), new Steering(), new Steering(), new Steering(), new Steering() };
     Steering Lane_(Lane lane) { return lanes[(int)lane]; }
     // Forces a clean start where the goal itself has not moved far enough to notice:
     // the next tree in a sweep may be three paces away, and the clock he ran up
@@ -1722,6 +1724,9 @@ public class Companion : BaseUnityPlugin {
         patrolStep = (patrolStep + 1) % 8;
         float angle = patrolStep * 45f * Mathf.Deg2Rad;
         destination = anchor + new Vector3(Mathf.Sin(angle), 0f, Mathf.Cos(angle)) * patrolRing;
+        // A new post is a new walk however short the hop, and the hop is short: a
+        // 45-degree step round a 6 m ring is a 4.59 m chord, under the auto-reset.
+        Fresh(Lane.Job);
     }
     bool Guard(string raw) {
         var me = Player.m_localPlayer;
@@ -2402,7 +2407,11 @@ public class Companion : BaseUnityPlugin {
         s.goal = goal;
         Vector3 delta = goal - player.transform.position;
         delta.y = 0;
-        if (delta.magnitude < arrival) return Step.Arrived;
+        // Clearing here covers every handover that can only happen from an arrival:
+        // Mule, Resume, Unload, ResumeSweep, GleanOrFinish. Without it he could snag
+        // while following, have you walk back into his arrival radius, and then be
+        // declared wedged over a stall that had already cleared.
+        if (delta.magnitude < arrival) { s.previous = player.transform.position; s.stuckTime = 0f; return Step.Arrived; }
         var direction = SelectWalkDirection(s, player.transform.position, delta.normalized);
         if (direction == Vector3.zero) {
             // Try the handle before declaring the way shut.
@@ -2455,6 +2464,7 @@ public class Companion : BaseUnityPlugin {
             if (!lockedOn && WieldWeapon(player)) {
                 threat = hurtBy;
                 fightFrom = player.transform.position;
+                Fresh(Lane.Fight);   // a new foe is a new approach, however close it stands
                 if (Time.time - lastShout > 10f) {
                     lastShout = Time.time;
                     Say("Right — that one wants a fight. " + Localization.instance.Localize(hurtBy.m_name) + ".");
@@ -2490,6 +2500,7 @@ public class Companion : BaseUnityPlugin {
         if (!found || !WieldWeapon(player)) return false;
         threat = found;
         fightFrom = player.transform.position;
+        Fresh(Lane.Fight);   // likewise: a pack member two paces on is still a new approach
         string name = Localization.instance.Localize(found.m_name);
         Logger.LogInfo("Engaging " + name);
         if (Time.time - lastShout > 10f) {
@@ -2536,7 +2547,7 @@ public class Companion : BaseUnityPlugin {
             Vector3 away = player.transform.position - edge; away.y = 0;
             if (away.sqrMagnitude > 0.0001f && away.magnitude < Reach(player, threat) * 2.5f) {
                 SwingAt(player, threat);  // keep facing it while giving ground
-                StepToward(Lane.Fight, player, player.transform.position + away.normalized * 6f, 0.5f);
+                StepToward(Lane.Backoff, player, player.transform.position + away.normalized * 6f, 0.5f);
                 return;
             }
         }
