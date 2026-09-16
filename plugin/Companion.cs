@@ -1290,23 +1290,61 @@ public class Companion : BaseUnityPlugin {
             : made + ": " + string.Join(", ", parts) +
               (station ? ", at a " + Localization.instance.Localize(station.m_name) + "." : ", by hand."));
     }
+    // Everything the hammer, hoe and cultivator can build. Pieces are NOT in
+    // ObjectDB.m_recipes, which holds items only - so a question about a standing torch
+    // or a workbench found nothing at all. The tables hang off the tools, so they are
+    // readable whether or not he happens to be carrying one.
+    static List<Piece> BuildablePieces() {
+        var found = new List<Piece>();
+        if (!ObjectDB.instance) return found;
+        var seen = new HashSet<string>();
+        foreach (var prefab in ObjectDB.instance.m_items) {
+            var table = prefab ? prefab.GetComponent<ItemDrop>()?.m_itemData?.m_shared?.m_buildPieces : null;
+            if (table == null) continue;
+            foreach (var piecePrefab in table.m_pieces) {
+                var piece = piecePrefab ? piecePrefab.GetComponent<Piece>() : null;
+                // The same piece sits in more than one table; name it once.
+                if (piece && piece.m_enabled && seen.Add(piece.name)) found.Add(piece);
+            }
+        }
+        return found;
+    }
+    static string PieceName(Piece piece) { return Localization.instance.Localize(piece.m_name); }
+    void TellPiece(Piece piece) {
+        var parts = piece.m_resources.Where(x => x.m_resItem)
+            .Select(x => x.m_amount + " " + Localization.instance.Localize(x.m_resItem.m_itemData.m_shared.m_name)).ToList();
+        Say(PieceName(piece) + " (built with a hammer): " +
+            (parts.Count == 0 ? "nothing I can name." : string.Join(", ", parts) + "."));
+    }
     bool Recipes(Player speaker, string wanted) {
         string key = Key(Bare(wanted) ?? "");
         if (key.Length < 3 || !ObjectDB.instance) return false;
         var known = ObjectDB.instance.m_recipes.Where(r => r && r.m_item && r.m_enabled).ToList();
         var exact = known.FirstOrDefault(r => Key(RecipeName(r)) == key);
         if (exact != null) { TellRecipe(exact); return true; }
+        var pieces = BuildablePieces();
+        var exactPiece = pieces.FirstOrDefault(x => Key(PieceName(x)) == key);
+        if (exactPiece) { TellPiece(exactPiece); return true; }
         // "spear" is four different spears. Rather than answering about whichever
         // happened to be first in the table, name them and wait - the reply does not
         // need his name in front of it.
+        // Items and pieces are offered together: whoever asks does not care which kind
+        // of thing it is. "A spear" is an item, "the blue standing torch" is a piece.
         var loose = known.Where(r => KeyMatches(RecipeName(r), key))
-            .GroupBy(RecipeName).Select(g => g.First()).Take(5).ToList();
-        if (loose.Count == 0) return false;
-        if (loose.Count == 1) { TellRecipe(loose[0]); return true; }
-        var names = loose.Select(RecipeName).ToArray();
+            .GroupBy(RecipeName).Select(g => g.First()).ToList();
+        var built = pieces.Where(x => KeyMatches(PieceName(x), key))
+            .GroupBy(PieceName).Select(g => g.First()).ToList();
+        if (loose.Count + built.Count == 0) return false;
+        if (loose.Count + built.Count == 1) {
+            if (loose.Count == 1) TellRecipe(loose[0]); else TellPiece(built[0]);
+            return true;
+        }
+        var names = loose.Select(RecipeName).Concat(built.Select(PieceName)).Take(6).ToArray();
         AskFor(speaker, "Which — " + string.Join(", ", names) + "?", names, pick => {
-            var chosen = loose.FirstOrDefault(r => RecipeName(r) == pick);
-            if (chosen != null) TellRecipe(chosen);
+            var item = loose.FirstOrDefault(r => RecipeName(r) == pick);
+            if (item != null) { TellRecipe(item); return; }
+            var piece = built.FirstOrDefault(x => PieceName(x) == pick);
+            if (piece) TellPiece(piece);
         });
         return true;
     }
