@@ -68,6 +68,7 @@ public class Companion : BaseUnityPlugin {
     bool busy;
     int generation;
     float lastOrder, lastDeaf, lastBanter, stuckTime;
+    bool sprinting;   // Held across ticks so the run/walk decision has hysteresis.
     Player asked;            // Who he put a question to, and is listening to.
     string[] choices;        // Accepted answers; null means yes or no.
     Action<string> onAnswer;
@@ -2048,9 +2049,17 @@ public class Companion : BaseUnityPlugin {
         if (stuckTime > 3) return Step.Stuck;
         // Feed the real player controller so sprint and jump are handled like
         // ordinary input instead of only changing the replicated move vector.
-        bool sprint = delta.magnitude > 6f && player.GetStamina() > player.GetMaxStamina() * 0.2f;
-        player.SetControls(direction, false, false, false, false, false, false, jump, false, sprint, false);
+        // Sprinting suppresses regen entirely and costs a further second of dead time
+        // after it stops (Player.RPC_UseStamina resets m_staminaRegenTimer), so the
+        // band has to be wide or he flickers in and out of a run every second.
+        float stamina = player.GetStamina() / Mathf.Max(1f, player.GetMaxStamina());
+        sprinting = delta.magnitude > 6f && (sprinting ? stamina > 0.15f : stamina > 0.4f);
+        // Jump is deliberately NOT passed to SetControls: it fires Jump() internally,
+        // before the line below puts the real heading into m_moveDir, so the leap
+        // would be thrown along a stale look direction.
+        player.SetControls(direction, false, false, false, false, false, false, false, false, sprinting, false);
         move.SetValue(player, direction);
+        if (jump) player.Jump();
         return Step.Moving;
     }
 
@@ -2278,9 +2287,16 @@ public class Companion : BaseUnityPlugin {
         }
         // Probe from above the destination so uphill terrain is still found.
         Vector3 foot = origin + direction * 1.35f + Vector3.up * 2.2f;
-        if (!Physics.Raycast(foot, Vector3.down, out RaycastHit ground, 4.5f, mask)) return false;
-        // Reject cliffs and near-vertical faces while allowing ordinary Valheim slopes.
-        return Vector3.Angle(ground.normal, Vector3.up) <= 48f;
+        if (!Physics.Raycast(foot, Vector3.down, out RaycastHit ground, 4.5f, mask)) {
+            // No floor: open water reads exactly like a void, because the mask holds
+            // no water layer. Once he is actually swimming that is fine to cross, and
+            // Drive breaks off if the stamina keeping him up runs low.
+            return Player.m_localPlayer && Player.m_localPlayer.IsSwimming();
+        }
+        // Valheim slides a player on anything past 38 degrees (Character.GetSlideAngle),
+        // at 5 m/s and with no steering authority, so treating 48 as walkable was
+        // authorising ten degrees of guaranteed loss of control. Stay under it.
+        return Vector3.Angle(ground.normal, Vector3.up) <= 35f;
     }
     [HarmonyPatch(typeof(PlayerController), "FixedUpdate")]
     class Controls {

@@ -80,6 +80,46 @@ dotnet SDK and ILSpy are already handled, and runs offline. Open question is whi
 hears you — the laptop's mic works today if it is in the room; a mic on the PC would mean
 binding the bridge past loopback, which is a real decision rather than a detail.
 
+## Defects found by review, all fixed — 15 Sep
+
+Twenty-five, across three workflows, every one in code written the same day and already
+read back once. Recorded because the pattern matters more than the list: almost all of them
+were code that is correct in isolation and wrong against the engine's actual behaviour.
+
+**Silent stalls.** `Job.Mend` had no case in `NextGoal`, so the first blunt axe froze him
+for good. `Peckish` never checked it had room, so a full pack plus food on the ground looped
+forever — and sat above the haul that would have emptied the pack. An attacker he could not
+path to was cleared and re-acquired every scan, freezing the job; an archer across a ravine
+would have stopped him indefinitely.
+
+**Never worked at all.** `Player.m_currentStation` is written only by `CraftingStation.Interact`,
+which also opens the crafting window, and `UpdateStations` clears it on any frame that window
+is not visible. A bot never opens it, so `GetCurrentCraftingStation()` reads null on a forge.
+`repair` and `craft` — both asked for by name — could not have run.
+
+**Silent deadlock.** `ItemData.IsWeapon()` is true for torches and bows. `Humanoid.EquipItem`
+returns false and does nothing for a broken item, a return ignored at all three call sites.
+A snapped axe is unequipped by the game, so `Blunt()` (which read the equipped tool) never
+fired the mend errand, and `Wield` re-picked the broken axe and returned true anyway.
+
+**Item loss.** `TombStone` carries a `Container`, so every chest scan found gravestones — a
+haul run at a base where anyone had died would empty the load into the grave. `craft 20 wood
+arrows` made 400 and consumed twenty times the wood.
+
+**Engine mismatches.** Valheim slides a player past 38 degrees; `IsWalkable` accepted 48.
+`IsWalkable` needs a ground hit on a mask with no water layer, so he stopped dead at any
+shoreline. And `SetControls` calls `Jump()` internally *before* the reflected `m_moveDir`
+correction lands, while `Character.Jump` throws the forward impulse along `m_moveDir` — so
+every jump went wherever he last looked, not where he was walking.
+
+## Still open from the locomotion plan
+
+Per-lane steering state. `previous` and `stuckTime` are shared by every job and every
+overlay, so a fight that interrupts a walk hands back a contaminated stuck clock. The plan
+proposes one `Steering` record per lane (job, pickup, flee, fight, retreat) and deleting
+every hand-written reset. Correct, and a large enough change that it wants doing on its own
+rather than at the end of a session.
+
 ## In flight
 
 - **Chained thoughts** — turning every dead end into "can't do X because Y, so fix Y, then
