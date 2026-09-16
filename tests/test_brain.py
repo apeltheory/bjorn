@@ -2,7 +2,7 @@ import json
 import os
 import unittest
 from unittest.mock import patch
-from brain.server import ACTIONS, Planner, offline, validate
+from brain.server import ACTIONS, Heard, Planner, offline, validate
 
 class BrainTests(unittest.TestCase):
     def test_basic_orders(self):
@@ -69,5 +69,28 @@ class BrainTests(unittest.TestCase):
         with self.assertRaises(TimeoutError): planner.decide('come along', {})
         self.assertEqual(planner.calls, 1)
         self.assertEqual(planner.decide('come along', {})['action'], 'chat')
+
+class HeardTests(unittest.TestCase):
+    """The queue that carries spoken orders to the plugin."""
+
+    def test_lines_are_taken_once_and_in_order(self):
+        heard = Heard()
+        heard.add('Bjorn, chop wood')
+        heard.add('Bjorn, guard the camp')
+        self.assertEqual(heard.take(), ['Bjorn, chop wood', 'Bjorn, guard the camp'])
+        self.assertEqual(heard.take(), [])
+
+    def test_junk_is_refused(self):
+        heard = Heard()
+        for bad in ['', '   ', 'x' * 501]:
+            with self.assertRaises(ValueError): heard.add(bad)
+
+    def test_queue_is_bounded(self):
+        # A transcriber left running while the game is closed must not grow it forever.
+        heard = Heard(limit=3)
+        for i in range(10): heard.add(f'Bjorn, line {i}')
+        kept = heard.take()
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(kept[-1], 'Bjorn, line 9')
 
 if __name__ == '__main__': unittest.main()

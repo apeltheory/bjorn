@@ -213,6 +213,34 @@ likely to strand him on a long walk home.
 
 The companion mod is client-side; it does not require a server mod.
 
+## Talking to him out loud
+
+Valheim has no voice chat of its own — there is no VOIP class anywhere in the game — so
+nothing taps the game's audio. Speech reaches him by a different route:
+
+    you speak -> anything that transcribes -> POST /listen -> the plugin polls
+             -> the same dispatch as typed chat -> he answers in chat
+
+`scripts/say-to-bjorn.py "Bjorn, chop wood"` is that seam, and works with no microphone at
+all, which is how the path is tested. Point any speech-to-text you like at it.
+
+The important property: **a spoken order can do nothing a typed one could not.** It still
+has to start with his name, it still goes through the same cooldown, the same safety rules
+and the same fall-through to the planner. The nearest player within 40 m is treated as the
+speaker, so `follow me` and `bring me wood` know who they mean; with nobody near, he logs
+that he heard it and does nothing.
+
+Two things already built fit this well. The name prefix is the wake word, so it needs no
+separate one. And after he asks a question, the next thing you say counts without his name,
+because the follow-up window does not care whether the answer was typed or spoken.
+
+Speech recognition will mangle `flint` and `greyling` constantly. That matters less than it
+sounds: names are matched with case, spacing and punctuation ignored, and anything that
+still misses goes to Claude, which usually recovers the intent.
+
+Turn it on with `Listen = true` in the mod config. It is off by default and polls nothing
+while off.
+
 ## When he does not understand
 
 Every order that no direct command claims is sent to the planner, which reads the
@@ -283,6 +311,8 @@ runtime/game/BepInEx/config/local.bjorn.companion.cfg
 - `GuardRadius` (30): how far from a camp's centre counts as inside it on patrol, 8-120 m.
 - `DefendSelf` (true): fight back at anything hostile that comes close during other work. Guard duty ignores this and always fights.
 - `PileWhenNoChest` (true): on a run home, leave anything the chests cannot take on the ground rather than ending the job.
+- `CampCentre` / `CampRadius`: written by `learn the camp`; what he knows of the base's shape.
+- `Listen` (false): poll the bridge for spoken orders. Leave off unless something is transcribing speech into it.
 
 Other than the in-game F8 toggle, edit configuration while the game is closed.
 
@@ -302,6 +332,7 @@ Other than the in-game F8 toggle, edit configuration while the game is closed.
 | `scripts/smoke.py` | Test authentication and a basic order against the running bridge |
 | `scripts/check-api.py` | Make a small direct Anthropic connection test |
 | `scripts/check-commands.py` | Static checks on the chat dispatch: unreachable commands, duplicates, truncated chat lines |
+| `scripts/say-to-bjorn.py` | Push a line to Bjorn as if spoken; the seam any speech-to-text plugs into |
 | `runtime/game/BepInEx/plugins/` | Installed Bjorn and Better Networking plugins |
 | `runtime/game/BepInEx/LogOutput.log` | Mod/game log |
 | `runtime/unity.log` | Unity log from launches that explicitly selected this file |

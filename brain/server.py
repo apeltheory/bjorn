@@ -1,4 +1,5 @@
 """Bjorn's loopback-only planner. Python standard library; no dependencies."""
+import collections
 import json
 import os
 import re
@@ -127,7 +128,34 @@ class Planner:
         return validate(json.loads(text))
 
 
-def serve():
+class Heard:
+    """Transcripts waiting for the plugin to collect.
+
+    Speech reaches Bjorn by being typed into this queue rather than through the
+    game, so nothing has to tap Valheim's audio. Bounded, because a transcriber
+    left running while the game is closed would otherwise grow without limit.
+    """
+
+    def __init__(self, limit=8):
+        self.lines = collections.deque(maxlen=limit)
+        self.lock = threading.Lock()
+
+    def add(self, text):
+        text = text.strip()
+        if not text or len(text) > 500:
+            raise ValueError('Bad transcript')
+        with self.lock:
+            self.lines.append(text)
+        return len(self.lines)
+
+    def take(self):
+        with self.lock:
+            taken = list(self.lines)
+            self.lines.clear()
+        return taken
+
+
+def serve(port=8765):
     runtime = ROOT / 'runtime'
     runtime.mkdir(mode=0o700, exist_ok=True)
     token_path = runtime / 'bridge.token'
@@ -137,21 +165,57 @@ def serve():
             file.write(secrets.token_hex(32))
     token = token_path.read_text().strip()
     planner = Planner()
+    heard = Heard()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass  # Never log orders, credentials, or API bodies.
 
+        def authorised(self):
+            if secrets.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + token):
+                return True
+            self.send_error(401)
+            return False
+
+        def body(self, cap=16384):
+            size = int(self.headers.get('Content-Length', '0'))
+            if not 0 < size <= cap:
+                raise ValueError('Bad length')
+            return json.loads(self.rfile.read(size))
+
+        def reply(self, result):
+            data = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            # The plugin collects anything spoken since it last asked.
+            if self.path != '/orders':
+                self.send_error(404); return
+            if not self.authorised():
+                return
+            self.reply({'orders': heard.take()})
+
         def do_POST(self):
+            if not self.authorised():
+                return
+            if self.path == '/listen':
+                # A transcript from whatever is listening. Never interpreted here:
+                # it goes to the plugin and takes the same path as typed chat, so
+                # the same name prefix and the same safety rules apply.
+                try:
+                    depth = heard.add(self.body(2048)['text'])
+                except (ValueError, KeyError, TypeError):
+                    self.send_error(400); return
+                self.reply({'queued': depth})
+                return
             if self.path != '/decide':
                 self.send_error(404); return
-            if not secrets.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + token):
-                self.send_error(401); return
             try:
-                size = int(self.headers.get('Content-Length', '0'))
-                if not 0 < size <= 16384:
-                    self.send_error(413); return
-                payload = json.loads(self.rfile.read(size))
+                payload = self.body()
                 message, state = payload['message'], payload['state']
                 if not isinstance(message, str) or len(message) > 500 or not isinstance(state, dict):
                     raise ValueError('Bad request')
@@ -160,16 +224,11 @@ def serve():
                 self.send_error(400); return
             except Exception:
                 result = {'action': 'chat', 'reply': 'My thoughts falter. I can still heed follow, stay, and inventory.'}
-            data = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self.reply(result)
 
-    print(f'Bjorn listening on 127.0.0.1:8765; mode={"Anthropic" if planner.key else "offline"}; call cap={planner.limit}', flush=True)
-    ThreadingHTTPServer(('127.0.0.1', 8765), Handler).serve_forever()
+    print(f'Bjorn listening on 127.0.0.1:{port}; mode={"Anthropic" if planner.key else "offline"}; call cap={planner.limit}', flush=True)
+    ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
 
 
 if __name__ == '__main__':
-    serve()
+    serve(int(os.getenv('BJORN_PORT', '8765')))

@@ -28,7 +28,7 @@ public class Companion : BaseUnityPlugin {
     float campSpan;
     bool campKnown;
     ConfigEntry<float> jobRadius, jobMinutes, guardRadius;
-    ConfigEntry<bool> botEnabled, defendSelf, pileOver;
+    ConfigEntry<bool> botEnabled, defendSelf, pileOver, listen;
     ConfigEntry<KeyboardShortcut> toggleKey;
     UnityWebRequest pendingRequest;
     Harmony harmony;
@@ -109,11 +109,13 @@ public class Companion : BaseUnityPlugin {
         pileOver = Config.Bind("Bot", "PileWhenNoChest", true, "On a run home, leave anything the chest cannot take on the ground rather than stopping the job. Dropped items persist in Valheim.");
         defendSelf = Config.Bind("Bot", "DefendSelf", true, "Fight back at anything hostile that comes close while doing other work. Guard duty ignores this and always fights.");
         tokenFile = Config.Bind("Bridge", "TokenFile", "/home/apel-xps/Work/valheim-companion/runtime/bridge.token", "Local bridge token file.");
+        listen = Config.Bind("Bridge", "Listen", false, "Poll the bridge for spoken orders. Leave off unless something is transcribing speech into it.");
         LoadPlaces();
         LoadCamp();
         harmony = new Harmony("local.bjorn.companion");
         harmony.PatchAll();
         Application.runInBackground = true;
+        StartCoroutine(ListenLoop());
         Logger.LogInfo("Bjorn ready. Any nearby player can address orders to Bjorn.");
     }
     void Update() {
@@ -266,6 +268,32 @@ public class Companion : BaseUnityPlugin {
             Logger.LogInfo("Addressed order ignored: speaking player is not loaded nearby.");
             return;
         }
+        Dispatch(speaker, text, addressed);
+    }
+    // Spoken orders arrive here from the bridge. They take the identical path to
+    // typed chat - same name prefix, same cooldown, same safety - so listening can
+    // never do anything typing could not. The nearest player is treated as the
+    // speaker, since that is who is talking to him.
+    internal void Spoken(string text) {
+        var me = Player.m_localPlayer;
+        if (!Active || string.IsNullOrWhiteSpace(text) || !me) return;
+        var speaker = Player.GetAllPlayers()
+            .Where(other => other && other != me && Vector3.Distance(other.transform.position, me.transform.position) <= 40f)
+            .OrderBy(other => Vector3.Distance(other.transform.position, me.transform.position)).FirstOrDefault();
+        if (!speaker) { Logger.LogInfo("Heard '" + text + "' but nobody is near enough to be speaking."); return; }
+        var prefix = botName.Value;
+        bool addressed = text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && text.Length > prefix.Length &&
+                         " ,:".IndexOf(text[prefix.Length]) >= 0;
+        if (!addressed && !(asked && Time.unscaledTime < askedUntil)) {
+            Logger.LogInfo("Heard '" + text + "' but it was not addressed to me.");
+            return;
+        }
+        Logger.LogInfo("Heard: " + text);
+        Dispatch(speaker, text, addressed);
+    }
+    void Dispatch(Player speaker, string text, bool addressed) {
+        var me = Player.m_localPlayer;
+        var prefix = botName.Value;
         if (!addressed) {
             // Only the person he asked can answer, and only that question.
             if (speaker == asked) Answered(text);
@@ -1595,6 +1623,27 @@ public class Companion : BaseUnityPlugin {
         Say("I fight back on my own, eat when I need to, and go back for my gear when I fall.");
         Say("Also: deposit, take all, craft, repair, eat, equip, unequip, drop, open the door, feed the fire — and emotes like wave and dance.");
     }
+    // Only runs when Listen is on, so there is no traffic for anyone not using voice.
+    IEnumerator ListenLoop() {
+        var wait = new WaitForSeconds(1.5f);
+        while (true) {
+            yield return wait;
+            if (!listen.Value || !Active || busy) continue;
+            string token;
+            try { token = File.ReadAllText(tokenFile.Value).Trim(); } catch { continue; }
+            using (var request = UnityWebRequest.Get("http://127.0.0.1:8765/orders")) {
+                request.SetRequestHeader("Authorization", "Bearer " + token);
+                request.timeout = 5;
+                yield return request.SendWebRequest();
+                if (request.result != UnityWebRequest.Result.Success) continue;
+                Heard heard = null;
+                try { heard = JsonConvert.DeserializeObject<Heard>(request.downloadHandler.text); } catch { }
+                if (heard?.orders == null) continue;
+                foreach (var line in heard.orders) Spoken(line);
+            }
+        }
+    }
+    class Heard { public string[] orders; }
     IEnumerator Decide(string order, Player speaker, int version) {
         string token;
         try { token = File.ReadAllText(tokenFile.Value).Trim(); }

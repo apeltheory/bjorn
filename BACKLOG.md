@@ -37,7 +37,25 @@ starting with `Bjorn, self test`.
 | 21 | Drop on the floor when there aren't enough chests | Uses every chest at home; piles on the ground when none has room, and keeps working |
 | 22 | "repair your stuff", "eat up" | Direct synonyms. Fixed `eat up` matching **turnip soup** via the `up` substring, and `bring me some wood` failing because `some` became part of the item name |
 | 23 | A private repo | `github.com/apeltheory/valheim-companion`, secrets and decompiled game source excluded |
+| 25 | Camp awareness across a multi-house base | `learn the camp` surveys via `Piece.GetAllPiecesInRadius`, saves centre and extent; guard patrols the real camp, mending finds a real bench |
+| 26 | Voice — he hears you, replies in text | Bridge and plugin plumbing done and tested; transcriber not yet chosen. See below |
 | 24 | Ask follow-up questions, accept replies without his name | Ask-and-listen primitive: one player, 25 seconds, one answer, and the answer can only resolve the question asked — it cannot start a job |
+
+## Voice — listening, built as far as it can go without a transcriber
+
+Valheim has no voice chat of its own (checked: no VOIP class in 631 decompiled files), and
+tapping a third-party voice mod's decoded audio would mean Harmony-patching another mod's
+internals — fragile, version-locked, and needing identical installs on both machines.
+
+The route taken instead skips the game entirely: speech is transcribed by anything you like,
+posted to the bridge, collected by the plugin, and dispatched exactly as typed chat. Built
+and tested without any audio: `POST /listen`, `GET /orders`, a bounded queue, token auth on
+both, plugin polling behind a `Listen` config flag, and `scripts/say-to-bjorn.py` as the seam.
+
+Still to choose: the transcriber. `whisper.cpp` vendored into `.tools/` would match how the
+dotnet SDK and ILSpy are already handled, and runs offline. Open question is which machine
+hears you — the laptop's mic works today if it is in the room; a mic on the PC would mean
+binding the bridge past loopback, which is a real decision rather than a detail.
 
 ## In flight
 
