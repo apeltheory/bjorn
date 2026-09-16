@@ -2749,17 +2749,21 @@ public class Companion : BaseUnityPlugin {
     // Logged when he gives up, so a stuck report becomes a lookup instead of a guess.
     string Probes(Vector3 origin, Vector3 desired, int mask) {
         var reasons = new List<string>();
-        foreach (float angle in new[] { 0f, -35f, 35f, -70f, 70f, -110f, 110f, 180f }) {
+        // The same headings SelectWalkDirection tries, or the report describes a search
+        // he never ran.
+        foreach (float angle in turns) {
             Vector3 candidate = Quaternion.AngleAxis(angle, Vector3.up) * desired;
-            candidate.y = 0;
-            if (candidate.sqrMagnitude < 0.01f) continue;
-            candidate.Normalize();
+            var refused = WhyRefused(origin, candidate, mask, out float rise, out float slope);
             string why;
-            if (!GroundAhead(origin, candidate, 1.35f, mask, out float rise, out float slope)) why = "void";
-            else if (rise > StepUp) why = "wall " + rise.ToString("0.0");
-            else if (rise < -StepDown) why = "drop " + rise.ToString("0.0");
-            else if (slope > 35f) why = "slope " + slope.ToString("0");
-            else why = "blocked at chest, rise " + rise.ToString("0.0");
+            switch (refused) {
+                case Refusal.None: why = "clear"; break;
+                case Refusal.Void: why = "nothing to stand on"; break;
+                case Refusal.Wall: why = "wall " + rise.ToString("0.0"); break;
+                case Refusal.Drop: why = "drop " + rise.ToString("0.0"); break;
+                case Refusal.Slope: why = "slope " + slope.ToString("0"); break;
+                case Refusal.Chest: why = "wall at chest"; break;
+                default: continue;
+            }
             reasons.Add(angle.ToString("0") + "=" + why);
         }
         var shut = Nearby<Door>(origin, 3f).FirstOrDefault();
@@ -2809,28 +2813,38 @@ public class Companion : BaseUnityPlugin {
         return best;
     }
 
-    bool IsWalkable(Vector3 origin, Vector3 direction, int mask) {
+    // Why a heading is refused. The decision and the diagnostic read the SAME function,
+    // so the log can never disagree with what the steering actually did - the first
+    // version of the report labelled open meadow as "blocked at chest", which is the
+    // worst possible bug in the thing you reach for when something is stuck.
+    enum Refusal { None, NoHeading, Void, Wall, Drop, Slope, Chest }
+
+    Refusal WhyRefused(Vector3 origin, Vector3 direction, int mask, out float rise, out float slope) {
+        rise = 0f; slope = 0f;
         direction.y = 0;
-        if (direction.sqrMagnitude < 0.01f) return false;
+        if (direction.sqrMagnitude < 0.01f) return Refusal.NoHeading;
         direction.Normalize();
-        if (!GroundAhead(origin, direction, 1.35f, mask, out float rise, out float slope)) {
-            // No floor: open water reads exactly like a void, because the mask holds
-            // no water layer. Once he is actually swimming that is fine to cross, and
-            // Drive breaks off if the stamina keeping him up runs low.
-            return Player.m_localPlayer && Player.m_localPlayer.IsSwimming();
+        if (!GroundAhead(origin, direction, 1.35f, mask, out rise, out slope)) {
+            // No floor: open water reads exactly like a void, because the mask holds no
+            // water layer. Once he is actually swimming that is fine to cross, and Drive
+            // breaks off if the stamina keeping him up runs low.
+            return Player.m_localPlayer && Player.m_localPlayer.IsSwimming() ? Refusal.None : Refusal.Void;
         }
-        if (rise > StepUp || rise < -StepDown) return false;   // a wall, or a fall
+        if (rise > StepUp) return Refusal.Wall;
+        if (rise < -StepDown) return Refusal.Drop;
         // Valheim slides a player on anything past 38 degrees (Character.GetSlideAngle),
         // at 5 m/s and with no steering authority, so stay under it.
-        if (slope > 35f) return false;
-        // A face at chest height only blocks when it is not a lip he can hop. This is
-        // the case that stranded him: jumping used to be decided only AFTER a
-        // direction was judged walkable, so he could never jump the very thing that
-        // made it unwalkable.
+        if (slope > 35f) return Refusal.Slope;
+        // A face at chest height only blocks when it is not a lip he can hop. This is the
+        // case that stranded him: jumping used to be decided only AFTER a direction was
+        // judged walkable, so he could never jump the thing that made it unwalkable.
         Vector3 chest = origin + Vector3.up * 0.65f;
         if (Physics.Raycast(chest, direction, out RaycastHit obstacle, 1.35f, mask) && obstacle.normal.y < 0.55f)
-            return rise >= 0.25f;
-        return true;
+            return rise >= 0.25f ? Refusal.None : Refusal.Chest;
+        return Refusal.None;
+    }
+    bool IsWalkable(Vector3 origin, Vector3 direction, int mask) {
+        return WhyRefused(origin, direction, mask, out _, out _) == Refusal.None;
     }
     [HarmonyPatch(typeof(PlayerController), "FixedUpdate")]
     class Controls {
