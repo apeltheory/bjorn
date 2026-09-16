@@ -634,7 +634,7 @@ public class Companion : BaseUnityPlugin {
         var creatures = Character.GetAllCharacters()
             .Where(c => c && c != me && !c.IsDead() && Vector3.Distance(c.transform.position, position) <= 30f).ToList();
         var parts = new List<string>();
-        var beasts = creatures.Where(c => !c.IsPlayer() && !c.IsTamed()).ToList();
+        var beasts = creatures.Where(c => !c.IsPlayer() && !c.IsTamed() && c.GetFaction() != Character.Faction.TrainingDummy).ToList();
         if (beasts.Count > 0)
             parts.Add(string.Join(", ", beasts.GroupBy(c => Localization.instance.Localize(c.m_name))
                 .OrderByDescending(g => g.Count()).Take(3).Select(g => g.Count() + " " + g.Key)));
@@ -1020,12 +1020,21 @@ public class Companion : BaseUnityPlugin {
             .Where(c => !Skipped(skip, c) && IsLive(c))
             .OrderBy(c => Vector3.Distance(c.transform.position, from)).FirstOrDefault();
     }
+    // Valheim's faction rules say a training dummy is an enemy of players, which is
+    // right for swinging at one on purpose and wrong for choosing a fight. A dummy
+    // never dies, so picking one means fighting it forever and ignoring every order.
+    // He will still attack one if you name it.
+    static bool WorthFighting(Character c, Player me) {
+        return c && c != me && !c.IsDead() && !c.IsPlayer() && !c.IsTamed() &&
+               c.GetFaction() != Character.Faction.TrainingDummy && BaseAI.IsEnemy(me, c);
+    }
     // Valheim's own faction rules decide what counts as a foe, so tamed beasts and
     // other vikings are never targets.
     Character NextFoe(Vector3 centre, string filter, HashSet<int> skip, Vector3 from) {
         var me = Player.m_localPlayer;
         return Character.GetAllCharacters()
-            .Where(c => c && c != me && !c.IsDead() && !c.IsPlayer() && !c.IsTamed() && BaseAI.IsEnemy(me, c) &&
+            .Where(c => (filter != null ? c && c != me && !c.IsDead() && !c.IsPlayer() && !c.IsTamed() && BaseAI.IsEnemy(me, c)
+                                        : WorthFighting(c, me)) &&
                         !Skipped(skip, c) &&
                         Vector3.Distance(c.transform.position, centre) <= SweepRadius &&
                         (filter == null || KeyMatches(Localization.instance.Localize(c.m_name), Key(filter))))
@@ -1244,7 +1253,8 @@ public class Companion : BaseUnityPlugin {
     internal void Struck(HitData hit) {
         if (!Active) return;
         var attacker = hit.GetAttacker();
-        if (!attacker || attacker == Player.m_localPlayer || attacker.IsPlayer() || attacker.IsTamed()) return;
+        if (!attacker || attacker == Player.m_localPlayer || attacker.IsPlayer() || attacker.IsTamed() ||
+            attacker.GetFaction() == Character.Faction.TrainingDummy) return;
         hurtBy = attacker;
         hurtAt = Time.time;
     }
@@ -2104,16 +2114,14 @@ public class Companion : BaseUnityPlugin {
         Vector3 watchFrom = guarding ? anchor : (escorting ? target.transform.position : player.transform.position);
         float watch = guarding ? Mathf.Max(GuardSpan, patrolRing + 8f) : (escorting ? 22f : 12f);
         var found = Character.GetAllCharacters()
-            .Where(c => c && c != player && !c.IsDead() && !c.IsPlayer() && !c.IsTamed() && BaseAI.IsEnemy(player, c) &&
-                        Vector3.Distance(c.transform.position, watchFrom) <= watch)
+            .Where(c => WorthFighting(c, player) && Vector3.Distance(c.transform.position, watchFrom) <= watch)
             // The boss is the point of the hunt; adds are a distraction from it.
             .OrderByDescending(c => c.IsBoss()).ThenBy(c => Vector3.Distance(c.transform.position, watchFrom))
             .FirstOrDefault();
         if (found && unreachable.Contains(found.GetInstanceID())) {
             // Already proved he cannot get to this one. Take the next best, or none.
             found = Character.GetAllCharacters()
-                .Where(c => c && c != player && !c.IsDead() && !c.IsPlayer() && !c.IsTamed() && BaseAI.IsEnemy(player, c) &&
-                            !unreachable.Contains(c.GetInstanceID()) &&
+                .Where(c => WorthFighting(c, player) && !unreachable.Contains(c.GetInstanceID()) &&
                             Vector3.Distance(c.transform.position, watchFrom) <= watch)
                 .OrderByDescending(c => c.IsBoss()).ThenBy(c => Vector3.Distance(c.transform.position, watchFrom))
                 .FirstOrDefault();
