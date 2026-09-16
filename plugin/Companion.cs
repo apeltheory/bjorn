@@ -67,6 +67,7 @@ public class Companion : BaseUnityPlugin {
     Component sweepTarget;
     Job errand;      // The interrupted real job, held for the length of a detour chain.
     int detours;     // Detours this job has spawned. Only a new order clears it.
+    float detourAt, detourBest;   // No-headway watchdog: a detour runs outside sweepUntil.
     int futile;      // Consecutive detours that changed nothing in the world.
     bool mendRefused;
     const int MaxDetours = 12, MaxFutile = 3;
@@ -181,10 +182,12 @@ public class Companion : BaseUnityPlugin {
         asked = null; choices = null; onAnswer = null;
         skippedDrops.Clear(); unreachable.Clear();
         deliverTo = null; deliverFilter = null; morsel = null;
-        // piles is NOT cleared here. FinishSweep halts and a chain re-enters at once,
-        // so clearing would hand the next sweep an empty skip list and let him collect
-        // the load he just dumped, carry it home, and dump it again.
-        sweepFilter = null; visited.Clear(); reachedAt = 0f;
+        // piles IS cleared here. No live chain runs through Halt - GleanOrFinish,
+        // AfterDetour and Unload all change job without it, and FinishSweep's only
+        // follow-on goes through Begin. Keeping them meant Sweep, which probes BEFORE
+        // Begin can clear, answered "nothing lies on the ground" beside his own old
+        // dump site for good.
+        sweepFilter = null; visited.Clear(); piles.Clear(); reachedAt = 0f;
         if (reason != null) { Logger.LogInfo("Stopped: " + reason); Say(reason); }
     }
     // Valheim's own pickup gives up on carry weight well before the last slot fills,
@@ -1546,8 +1549,12 @@ public class Companion : BaseUnityPlugin {
     // "take it home" on demand, rather than waiting for the pack to fill.
     bool HaulNow(Player speaker) {
         var me = Player.m_localPlayer;
+        // Deliberately NOT Needed(): being told to take it home is an instruction, not a
+        // question about the world. Asking meant a half-full pack answered "no" and fell
+        // through to Begin, whose Halt silently ended the job he was doing.
         if ((IsSweep || job == Job.Mule) && errand == Job.None &&
-            Needed(me, out var need, out var spot, out var said) && Detour(need, spot, said)) return true;
+            places.TryGetValue("home", out var stash) &&
+            Detour(Job.Haul, stash, "Taking it home. I'll come back for the rest.")) return true;
         if (!places.TryGetValue("home", out var home)) {
             Say("I know no home to take it to. Stand by a chest and say 'remember this as home'.");
             return true;
@@ -2051,6 +2058,7 @@ public class Companion : BaseUnityPlugin {
         destination = where;
         sweepTarget = null; reachedAt = 0f;
         Fresh(Lane.Job);
+        detourAt = Time.time; detourBest = float.MaxValue;
         if (line != null) Say(line);
         return true;
     }
@@ -2108,9 +2116,11 @@ public class Companion : BaseUnityPlugin {
             if (Vector3.Distance(spot, destination) > 0.5f) { destination = spot; reachedAt = 0f; return; }
         }
         if (reachedAt == 0f) reachedAt = Time.time;
-        if (Time.time - reachedAt > 8f)
+        if (Time.time - reachedAt > 8f) {
             Stumble(station ? "bench unreachable" : "no bench where I went");
-            Halt(station ? "I'm at the bench but can't get close enough to work." : "I came to mend, but there's no station here.");
+            Abandon(station ? "I'm at the bench but can't get close enough to work."
+                            : "I came to mend, but there's no station here.");
+        }
     }
     Component Probe(Job kind, Vector3 centre, string filter, HashSet<int> skip, Vector3 from) {
         switch (kind) {
@@ -2495,7 +2505,7 @@ public class Companion : BaseUnityPlugin {
         // ground at home and carry on, rather than standing there holding it.
         int piled = Loaded(player) && pileOver.Value ? Pile(player) : 0;
         if (moved == 0 && piled == 0) {
-            Halt(chests.Count == 0
+            Abandon(chests.Count == 0
                 ? (pileOver.Value ? "I'm home with a full pack and nothing here to put it in." : "No chest here, and you've told me not to pile it up.")
                 : (pileOver.Value ? "The chests at home are full and there's nothing of mine worth leaving." : "The chests are full and you've told me not to pile the rest up."));
             return;
@@ -2509,7 +2519,9 @@ public class Companion : BaseUnityPlugin {
                 ? "Unloaded " + moved + (moved == 1 ? " stack" : " stacks") + " into " + chests.Count + (chests.Count == 1 ? " chest." : " chests.")
             : (chests.Count == 0 ? "No chest here — piled " : "Chests are full — piled ") + piled + " on the ground.";
         Say(what + (grabbed > 0 ? " Took food for the road." : "") + " Going back for more.");
-        job = Job.Resume; reachedAt = 0f;    }
+        // Reaching here proves a load moved: the nothing-moved case returned above. Not
+        // Progress() - hauled stacks would inflate the tally the job reports at the end.
+        AfterDetour(player, true);    }
     void TakeDrop(Player player) {
         var drop = (ItemDrop)sweepTarget;
         // Only the ZDO owner may pick an item up, so ask first and try again next tick.
@@ -2721,7 +2733,7 @@ public class Companion : BaseUnityPlugin {
             if (dryGround != Vector3.zero) StepToward(Lane.Flee, player, dryGround, 2.5f);
             return;
         }
-        if (job != Job.Patrol && job != Job.Escort && player.GetHealth() < player.GetMaxHealth() * 0.3f) { Stumble("hurt, broke off"); Halt("I must stop here. I cannot go on safely."); return; }
+        if (job != Job.Patrol && job != Job.Escort && player.GetHealth() < player.GetMaxHealth() * 0.3f) { Stumble("hurt, broke off"); Abandon("I must stop here. I cannot go on safely."); return; }
         if (IsSweep && Time.time > sweepUntil) { FinishSweep("I have spent long enough at it."); return; }
         // Checked before picking a target: a full pack or a blunt tool means the next
         // thing to do is the errand, not another tree.
@@ -2733,6 +2745,19 @@ public class Companion : BaseUnityPlugin {
         if (errand == Job.None && job != Job.Deliver && job != Job.Grave && Peckish(player)) { TakeMorsel(player); return; }
         if (Scavenging(player)) { Scavenge(player); return; }
         if (!NextGoal(player, out Vector3 goal, out float arrival)) return;
+        // A detour has no sweep clock behind it, and StepToward only calls him stuck
+        // when he is motionless to a centimetre - jittering against a fence is not. So
+        // measure closing rather than elapsed time: a genuinely long walk home is never
+        // mistaken for a stall, but making no headway for ninety seconds is.
+        if (errand != Job.None) {
+            float gap = Vector3.Distance(player.transform.position, goal);
+            if (gap < detourBest - 2f) { detourBest = gap; detourAt = Time.time; }
+            else if (Time.time - detourAt > 90f) {
+                Stumble("detour made no headway");
+                Abandon("I set out on an errand and I'm getting no closer.");
+                return;
+            }
+        }
         if ((job == Job.Follow || job == Job.Escort) && target) {
             Vector3 gap = target.transform.position - player.transform.position;
             // Only genuine distance ends a follow. A height gap is a staircase or a
@@ -2759,7 +2784,7 @@ public class Companion : BaseUnityPlugin {
                 // Wedged and shoving is a different failure from having nowhere to go,
                 // and they want different fixes, so say which.
                 Stumble(step == Step.Stuck ? "wedged" : "no way through");
-                Halt(step == Step.Stuck ? "I'm wedged fast here. I'll wait." : "The way is blocked. I will wait here.");
+                Abandon(step == Step.Stuck ? "I'm wedged fast here. I'll wait." : "The way is blocked. I will wait here.");
                 return;
         }
     }
