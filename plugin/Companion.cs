@@ -21,6 +21,28 @@ public class Companion : BaseUnityPlugin {
     enum Job { None, Follow, Come, Home, Bed, Fetch, Harvest, Chop, Mine, Fight, Haul, Mend, Resume, Patrol, Grave, Deliver, Escort, Mule, Tend }
     // Outcome of one tick of walking toward a point.
     enum Step { Moving, Arrived, Blocked, Stuck }
+    // Every job and every overlay walks through StepToward, so they share the rules.
+    // What they must NOT share is the bookkeeping: a fight that interrupts a walk was
+    // handing the walk back a stuck clock it had not earned, and a retargeted sweep
+    // inherited the last target's. One record per caller, and the fourteen hand-written
+    // resets that used to paper over it are gone.
+    enum Lane { Job, Fight, Flee, Pickup }
+    class Steering {
+        public float touched;        // when this lane last ran
+        public Vector3 goal;         // what it was walking to
+        public Vector3 previous;     // where he stood last tick
+        public float stuckTime;      // seconds frozen on the spot
+        public float avoidUntil;     // committed to rounding something until this time
+        public Vector3 avoidDirection;
+        public bool sprinting;       // held across ticks, for hysteresis
+    }
+    readonly Steering[] lanes = { new Steering(), new Steering(), new Steering(), new Steering() };
+    Steering Lane_(Lane lane) { return lanes[(int)lane]; }
+    // Forces a clean start where the goal itself has not moved far enough to notice:
+    // the next tree in a sweep may be three paces away, and the clock he ran up
+    // against the last one is not his.
+    void Fresh(Lane lane) { Lane_(lane).touched = 0f; }
+    void FreshAll() { foreach (var s in lanes) s.touched = 0f; }
     const float TargetSeconds = 30f; // Abandon one tree, rock, or foe that will not fall.
     ConfigEntry<string> botName, tokenFile, homePosition, bedPosition, waypoints, campCentre;
     ConfigEntry<float> campRadius;
@@ -71,17 +93,13 @@ public class Companion : BaseUnityPlugin {
     readonly Dictionary<string, Vector3> places = new Dictionary<string, Vector3>();
     bool busy;
     int generation;
-    float lastOrder, lastDeaf, lastBanter, stuckTime, lastExplain, doorUntil;
-    bool sprinting;   // Held across ticks so the run/walk decision has hysteresis.
+    float lastOrder, lastDeaf, lastBanter, lastExplain, doorUntil;
     Player asked;            // Who he put a question to, and is listening to.
     string[] choices;        // Accepted answers; null means yes or no.
     Action<string> onAnswer;
     float askedUntil;
     int bantered;
-    float avoidUntil;
     float jumpUntil;
-    Vector3 avoidDirection;
-    Vector3 previous;
     static readonly FieldInfo move = AccessTools.Field(typeof(Character), "m_moveDir");
     static readonly FieldInfo autorun = AccessTools.Field(typeof(Player), "m_autoRun");
     // Humanoid.ShowHandItems is protected, and it is the only thing that undoes
@@ -153,15 +171,16 @@ public class Companion : BaseUnityPlugin {
     }
     void Halt(string reason = null) {
         job = Job.None; errand = Job.None; target = null; bed = null; sweepTarget = null; threat = null;
+        FreshAll();
         furnace = null; lastRound = 0;
         asked = null; choices = null; onAnswer = null;
         skippedDrops.Clear(); unreachable.Clear(); mendTried = false;
         deliverTo = null; deliverFilter = null; morsel = null;
-        sweepFilter = null; visited.Clear(); piles.Clear(); stuckTime = 0; reachedAt = 0f;
+        sweepFilter = null; visited.Clear(); piles.Clear(); reachedAt = 0f;
         if (reason != null) { Logger.LogInfo("Stopped: " + reason); Say(reason); }
     }
     // Clear any running job and start a fresh one from the bot's current spot.
-    void Begin(Job next) { Halt(); job = next; previous = Player.m_localPlayer.transform.position; }
+    void Begin(Job next) { Halt(); job = next; }
     static bool Any(string value, params string[] options) { return options.Contains(value); }
 
     // ---- Asking, and listening for the answer ----------------------------
@@ -1383,9 +1402,9 @@ public class Companion : BaseUnityPlugin {
     // back and forth forever instead of following you.
     readonly HashSet<int> skippedDrops = new HashSet<int>();
     bool FetchDrop(Player player, ref ItemDrop which, ref float since) {
-        var step = StepToward(player, which.transform.position, 1.6f);
+        var step = StepToward(Lane.Pickup, player, which.transform.position, 1.6f);
         if (step != Step.Arrived) {
-            if (step != Step.Moving) { skippedDrops.Add(which.GetInstanceID()); which = null; stuckTime = 0; }
+            if (step != Step.Moving) { skippedDrops.Add(which.GetInstanceID()); which = null; Fresh(Lane.Pickup); }
             return false;
         }
         // Only the ZDO owner may pick an item up, so ask and retry for a few seconds.
@@ -1449,7 +1468,6 @@ public class Companion : BaseUnityPlugin {
         destination = home;
         // Come back to whoever asked once the pack is empty.
         errand = Job.Come; target = speaker;
-        previous = me.transform.position;
         Say("Taking it home.");
         return true;
     }
@@ -1837,8 +1855,8 @@ public class Companion : BaseUnityPlugin {
     }
     void Skip() {
         if (sweepTarget) { Stumble("gave up on " + sweepTarget.name); visited.Add(sweepTarget.GetInstanceID()); }
-        sweepTarget = null; reachedAt = 0f; stuckTime = 0;
-    }
+        Fresh(Lane.Job);
+        sweepTarget = null; reachedAt = 0f;    }
     // A Pickable without an item prefab throws inside GetHoverName; treat it as unnamed.
     static string PickableName(Pickable pickable) {
         try { return Localization.instance.Localize(pickable.GetHoverName()); }
@@ -1908,9 +1926,7 @@ public class Companion : BaseUnityPlugin {
         mendTried = true;   // one bench detour per job, or a refusal loops
         job = Job.Mend;
         destination = where;
-        sweepTarget = null; reachedAt = 0f; stuckTime = 0;
-        previous = me.transform.position;
-        Say("My " + name + " is nearly spent. I'll mend it and come back.");
+        sweepTarget = null; reachedAt = 0f;        Say("My " + name + " is nearly spent. I'll mend it and come back.");
         return true;
     }
     void Mend(Player player) {
@@ -1940,8 +1956,7 @@ public class Companion : BaseUnityPlugin {
             Halt(station ? "I'm at the bench but can't get close enough to work." : "I came to mend, but there's no station here.");
     }
     void ResumeSweep(Player player) {
-        job = Job.Resume; reachedAt = 0f; stuckTime = 0; previous = player.transform.position;
-    }
+        job = Job.Resume; reachedAt = 0f;    }
     // A full pack pauses the sweep rather than ending it: run the load to the home
     // chest, then walk back to the anchor and carry on. Deliberately does not go
     // through Halt, which would forget the anchor, filter and skip list.
@@ -1957,9 +1972,7 @@ public class Companion : BaseUnityPlugin {
         errand = job;
         job = Job.Haul;
         destination = home;
-        sweepTarget = null; reachedAt = 0f; stuckTime = 0;
-        previous = Player.m_localPlayer.transform.position;
-        Say("My pack is full. I'll run this home and come back for the rest.");
+        sweepTarget = null; reachedAt = 0f;        Say("My pack is full. I'll run this home and come back for the rest.");
         return true;
     }
     Component Probe(Job kind, Vector3 centre, string filter, HashSet<int> skip, Vector3 from) {
@@ -2016,8 +2029,7 @@ public class Companion : BaseUnityPlugin {
         visited.Clear();
         sweepFilter = null;
         job = Job.Fetch;
-        sweepTarget = null; reachedAt = 0f; stuckTime = 0;
-        sweepUntil = Time.time + SweepSeconds;
+        sweepTarget = null; reachedAt = 0f;        sweepUntil = Time.time + SweepSeconds;
         if (NextDrop(anchor, null, visited, player.transform.position) == null) {
             job = felling;  // Nothing to glean: report the felling, not a gather.
             FinishSweep(why);
@@ -2262,7 +2274,7 @@ public class Companion : BaseUnityPlugin {
         switch (job) {
             case Job.Follow:
             case Job.Escort:
-            case Job.Mule: stuckTime = 0; break;
+            case Job.Mule: break;
             case Job.Come: Halt("I'm here."); break;
             case Job.Home: Halt("I’m home."); break;
             case Job.Bed:
@@ -2282,8 +2294,7 @@ public class Companion : BaseUnityPlugin {
             case Job.Resume:
                 var back = errand;
                 errand = Job.None;
-                sweepTarget = null; reachedAt = 0f; stuckTime = 0;
-                sweepUntil = Time.time + SweepSeconds; // Each load gets a fresh clock.
+                sweepTarget = null; reachedAt = 0f;                sweepUntil = Time.time + SweepSeconds; // Each load gets a fresh clock.
                 if (back == Job.Come) { Halt("Unloaded, and back with you."); break; }
                 job = back;
                 Say(back == Job.Mule ? "Back with you. Load me up." : "Back to it.");
@@ -2360,9 +2371,7 @@ public class Companion : BaseUnityPlugin {
                 ? "Unloaded " + moved + (moved == 1 ? " stack" : " stacks") + " into " + chests.Count + (chests.Count == 1 ? " chest." : " chests.")
             : (chests.Count == 0 ? "No chest here — piled " : "Chests are full — piled ") + piled + " on the ground.";
         Say(what + (grabbed > 0 ? " Took food for the road." : "") + " Going back for more.");
-        job = Job.Resume; reachedAt = 0f; stuckTime = 0;
-        previous = player.transform.position;
-    }
+        job = Job.Resume; reachedAt = 0f;    }
     void TakeDrop(Player player) {
         var drop = (ItemDrop)sweepTarget;
         // Only the ZDO owner may pick an item up, so ask first and try again next tick.
@@ -2379,11 +2388,22 @@ public class Companion : BaseUnityPlugin {
     }
     // One tick of walking toward a point. Every job and the fight overlay share it,
     // so steering, jumping, sprinting and stuck detection behave the same everywhere.
-    Step StepToward(Player player, Vector3 goal, float arrival) {
+    Step StepToward(Lane lane, Player player, Vector3 goal, float arrival) {
+        var s = Lane_(lane);
+        // A lane idle for a moment, or whose goal has jumped, starts clean. Drift is
+        // not a jump: following a moving player must keep its stuck clock running.
+        if (Time.time - s.touched > 0.5f || Vector3.Distance(s.goal, goal) > 5f) {
+            s.previous = player.transform.position;
+            s.stuckTime = 0f;
+            s.avoidUntil = 0f;
+            s.sprinting = false;
+        }
+        s.touched = Time.time;
+        s.goal = goal;
         Vector3 delta = goal - player.transform.position;
         delta.y = 0;
         if (delta.magnitude < arrival) return Step.Arrived;
-        var direction = SelectWalkDirection(player.transform.position, delta.normalized);
+        var direction = SelectWalkDirection(s, player.transform.position, delta.normalized);
         if (direction == Vector3.zero) {
             // Try the handle before declaring the way shut.
             if (TryDoor(player, delta)) return Step.Moving;
@@ -2396,20 +2416,20 @@ public class Companion : BaseUnityPlugin {
         int mask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain");
         bool jump = Time.time >= jumpUntil && CanJumpForward(player.transform.position, direction, mask);
         if (jump) jumpUntil = Time.time + 1.2f;
-        if (Vector3.Distance(previous, player.transform.position) < 0.01f) stuckTime += Time.fixedDeltaTime; else stuckTime = 0;
-        previous = player.transform.position;
-        if (stuckTime > 3) return Step.Stuck;
+        if (Vector3.Distance(s.previous, player.transform.position) < 0.01f) s.stuckTime += Time.fixedDeltaTime; else s.stuckTime = 0f;
+        s.previous = player.transform.position;
+        if (s.stuckTime > 3) return Step.Stuck;
         // Feed the real player controller so sprint and jump are handled like
         // ordinary input instead of only changing the replicated move vector.
         // Sprinting suppresses regen entirely and costs a further second of dead time
         // after it stops (Player.RPC_UseStamina resets m_staminaRegenTimer), so the
         // band has to be wide or he flickers in and out of a run every second.
         float stamina = player.GetStamina() / Mathf.Max(1f, player.GetMaxStamina());
-        sprinting = delta.magnitude > 6f && (sprinting ? stamina > 0.15f : stamina > 0.4f);
+        s.sprinting = delta.magnitude > 6f && (s.sprinting ? stamina > 0.15f : stamina > 0.4f);
         // Jump is deliberately NOT passed to SetControls: it fires Jump() internally,
         // before the line below puts the real heading into m_moveDir, so the leap
         // would be thrown along a stale look direction.
-        player.SetControls(direction, false, false, false, false, false, false, false, false, sprinting, false);
+        player.SetControls(direction, false, false, false, false, false, false, false, false, s.sprinting, false);
         move.SetValue(player, direction);
         if (jump) player.Jump();
         return Step.Moving;
@@ -2435,7 +2455,6 @@ public class Companion : BaseUnityPlugin {
             if (!lockedOn && WieldWeapon(player)) {
                 threat = hurtBy;
                 fightFrom = player.transform.position;
-                stuckTime = 0;
                 if (Time.time - lastShout > 10f) {
                     lastShout = Time.time;
                     Say("Right — that one wants a fight. " + Localization.instance.Localize(hurtBy.m_name) + ".");
@@ -2471,7 +2490,6 @@ public class Companion : BaseUnityPlugin {
         if (!found || !WieldWeapon(player)) return false;
         threat = found;
         fightFrom = player.transform.position;
-        stuckTime = 0;
         string name = Localization.instance.Localize(found.m_name);
         Logger.LogInfo("Engaging " + name);
         if (Time.time - lastShout > 10f) {
@@ -2500,7 +2518,7 @@ public class Companion : BaseUnityPlugin {
             toHome.y = 0;
             if (toHome.magnitude > 5f && Vector3.Dot(toHome.normalized, away) > 0f) goal = home;
         }
-        StepToward(player, goal, 2f);
+        StepToward(Lane.Flee, player, goal, 2f);
     }
     // Foes he has proved he cannot reach, so he stops re-picking them every scan.
     // Cleared periodically, because terrain and the foe both move.
@@ -2518,20 +2536,20 @@ public class Companion : BaseUnityPlugin {
             Vector3 away = player.transform.position - edge; away.y = 0;
             if (away.sqrMagnitude > 0.0001f && away.magnitude < Reach(player, threat) * 2.5f) {
                 SwingAt(player, threat);  // keep facing it while giving ground
-                StepToward(player, player.transform.position + away.normalized * 6f, 0.5f);
+                StepToward(Lane.Fight, player, player.transform.position + away.normalized * 6f, 0.5f);
                 return;
             }
         }
         winded = false;
-        var step = StepToward(player, edge, Reach(player, threat));
+        var step = StepToward(Lane.Fight, player, edge, Reach(player, threat));
         if (step == Step.Arrived) { SwingAt(player, threat); return; }
         // Cannot reach it: remember that, so the next scan does not pick it straight
         // back up and freeze the job he was doing.
         if (step != Step.Moving) {
             unreachable.Add(threat.GetInstanceID());
+            Fresh(Lane.Fight);
             Stumble("cannot reach " + Localization.instance.Localize(threat.m_name));
-            threat = null; stuckTime = 0;
-        }
+            threat = null;        }
     }
 
     internal void Drive(Player player) {
@@ -2555,7 +2573,7 @@ public class Companion : BaseUnityPlugin {
         // machine - no in-game order can recover him.
         if (player.IsSwimming()) {
             if (Time.time - lastShout > 8f) { lastShout = Time.time; Say("I'm out of my depth. Making for shore."); }
-            if (dryGround != Vector3.zero) StepToward(player, dryGround, 2.5f);
+            if (dryGround != Vector3.zero) StepToward(Lane.Flee, player, dryGround, 2.5f);
             return;
         }
         if (job != Job.Patrol && job != Job.Escort && player.GetHealth() < player.GetMaxHealth() * 0.3f) { Stumble("hurt, broke off"); Halt("I must stop here. I cannot go on safely."); return; }
@@ -2578,7 +2596,7 @@ public class Companion : BaseUnityPlugin {
             // to below you and lets the stuck check decide.
             if (gap.magnitude > 35 || Math.Abs(gap.y) > 20) { Stumble("leash broke"); Halt("You are beyond my reach. Return for me."); return; }
         }
-        var step = StepToward(player, goal, arrival);
+        var step = StepToward(Lane.Job, player, goal, arrival);
         switch (step) {
             case Step.Arrived: Arrive(player); return;
             case Step.Moving: return;
@@ -2592,8 +2610,7 @@ public class Companion : BaseUnityPlugin {
                     if (Time.time < postUntil) return;
                     postUntil = Time.time + 1f;
                     if (++postsFailed >= 8) { Stumble("patrol boxed in"); Halt("I cannot walk the bounds from here. Set me somewhere clearer."); return; }
-                    NextPost(); stuckTime = 0;
-                    return;
+                    NextPost();                    return;
                 }
                 // Wedged and shoving is a different failure from having nowhere to go,
                 // and they want different fixes, so say which.
@@ -2690,11 +2707,11 @@ public class Companion : BaseUnityPlugin {
     }
     static readonly float[] turns = { 0f, -30f, 30f, -60f, 60f, -90f, 90f, -120f, 120f, -150f, 150f, 180f };
 
-    Vector3 SelectWalkDirection(Vector3 origin, Vector3 desired) {
+    Vector3 SelectWalkDirection(Steering s, Vector3 origin, Vector3 desired) {
         int mask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain");
         // Committed to rounding something: hold that line. A building takes several
         // metres to clear, and re-deciding every tick is what walks him back into it.
-        if (Time.time < avoidUntil && IsWalkable(origin, avoidDirection, mask)) return avoidDirection;
+        if (Time.time < s.avoidUntil && IsWalkable(origin, s.avoidDirection, mask)) return s.avoidDirection;
 
         bool barred = !IsWalkable(origin, desired, mask);
         Vector3 best = Vector3.zero;
@@ -2715,9 +2732,9 @@ public class Companion : BaseUnityPlugin {
             if (score > bestScore) { bestScore = score; best = candidate; }
         }
         if (best != Vector3.zero && Vector3.Dot(best, desired) < 0.95f) {
-            avoidDirection = best;
+            s.avoidDirection = best;
             // Long enough to walk the length of a building, not just past a trunk.
-            avoidUntil = Time.time + (barred ? 3f : 1f);
+            s.avoidUntil = Time.time + (barred ? 3f : 1f);
         }
         return best;
     }
