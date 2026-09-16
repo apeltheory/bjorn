@@ -357,7 +357,7 @@ public class Companion : BaseUnityPlugin {
             report.AppendLine("body   : health " + Mathf.RoundToInt(me.GetHealth()) + "/" + Mathf.RoundToInt(me.GetMaxHealth()) +
                               ", stamina " + Mathf.RoundToInt(me.GetStamina()) + "/" + Mathf.RoundToInt(me.GetMaxStamina()) +
                               ", foods " + me.GetFoods().Count + "/3, swimming=" + me.IsSwimming());
-            var held = me.GetCurrentWeapon();
+            var held = Held(me);
             report.AppendLine("hands  : " + (held != null
                 ? Localization.instance.Localize(held.m_shared.m_name) + " " + held.m_durability.ToString("0") + "/" + held.GetMaxDurability().ToString("0")
                 : "EMPTY"));
@@ -410,7 +410,7 @@ public class Companion : BaseUnityPlugin {
                 : (destination != Vector3.zero ? destination - at : me.transform.forward);
             facing.y = 0f;
             if (facing.sqrMagnitude < 0.01f) facing = Vector3.forward;
-            var held = me.GetCurrentWeapon();
+            var held = Held(me);
             line += " | hands=" + (held != null ? Localization.instance.Localize(held.m_shared.m_name) : "EMPTY") +
                     " | probes=" + Probes(at, facing.normalized,
                         LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain"));
@@ -616,7 +616,7 @@ public class Companion : BaseUnityPlugin {
         Begin(Job.Escort);
         target = speaker;
         GearUp(Player.m_localPlayer);
-        var weapon = Player.m_localPlayer.GetCurrentWeapon();
+        var weapon = Held(Player.m_localPlayer);
         Say(weapon == null ? "I'm with you, though I've no weapon to raise."
             : "I'm with you. My " + Localization.instance.Localize(weapon.m_shared.m_name) + " is yours — point me at it.");
     }
@@ -804,7 +804,7 @@ public class Companion : BaseUnityPlugin {
         return Localization.instance.Localize(best.m_shared.m_name) + " " + wear + "%";
     }
     string WeaponWord() {
-        var held = Player.m_localPlayer.GetCurrentWeapon();
+        var held = Held(Player.m_localPlayer);
         return held != null && IsFightingWeapon(held) ? "holding " + Localization.instance.Localize(held.m_shared.m_name) : null;
     }
     void Where() {
@@ -1771,7 +1771,7 @@ public class Companion : BaseUnityPlugin {
         patrolStep = 0;
         NextPost();
         GearUp(me);
-        var weapon = me.GetCurrentWeapon();
+        var weapon = Held(me);
         Say(weapon == null
             ? "I'll watch " + name + ", though I have no weapon to hand."
             : "I'll walk the bounds of " + name + " with my " + Localization.instance.Localize(weapon.m_shared.m_name) + " and keep it clear.");
@@ -1779,6 +1779,14 @@ public class Companion : BaseUnityPlugin {
     }
     // ItemData.IsWeapon() is true for torches and bows as well. A torch carries fire
     // damage, so ordering by damage will happily send him into melee holding one.
+    // Humanoid.GetCurrentWeapon falls back to m_unarmedWeapon, so it is NEVER null - a
+    // bare-handed bot reports "Unarmed" and every "is he holding something" test passes.
+    // That silently defeated EnsureHeld, whose whole job is to put a tool back in his
+    // hands when the engine has emptied them.
+    static ItemDrop.ItemData Held(Player player) {
+        var held = player ? player.GetCurrentWeapon() : null;
+        return held != null && held.m_shared.m_skillType != Skills.SkillType.Unarmed ? held : null;
+    }
     static bool IsFightingWeapon(ItemDrop.ItemData item) {
         var kind = item.m_shared.m_itemType;
         return item.IsWeapon() && kind != ItemDrop.ItemData.ItemType.Torch && kind != ItemDrop.ItemData.ItemType.Bow;
@@ -1803,7 +1811,7 @@ public class Companion : BaseUnityPlugin {
             .ThenByDescending(i => i.m_quality).FirstOrDefault();
     }
     bool WieldWeapon(Player player) {
-        var held = player.GetCurrentWeapon();
+        var held = Held(player);
         if (held != null && IsFightingWeapon(held) && Usable(held)) return true;
         var best = player.GetInventory().GetAllItems()
             .Where(i => IsFightingWeapon(i) && i.IsEquipable() && Usable(i))
@@ -1836,13 +1844,13 @@ public class Companion : BaseUnityPlugin {
     // Measured against Edge(), so this is the weapon's own reach to the target's
     // surface. Atgeirs and polearms genuinely outrange 2.8 m.
     static float Reach(Player player, Component what) {
-        var weapon = player.GetCurrentWeapon();
+        var weapon = Held(player);
         float swing = weapon?.m_shared?.m_attack != null ? weapon.m_shared.m_attack.m_attackRange : 2f;
         return Mathf.Clamp(swing, 1.6f, 4f);
     }
     // Picks up (or keeps) the best tool of a kind. Returns false when there is none.
     bool Wield(Player player, Skills.SkillType kind) {
-        var held = player.GetCurrentWeapon();
+        var held = Held(player);
         if (held != null && held.m_shared.m_skillType == kind && Usable(held)) return true;
         var tool = BestTool(kind);
         if (tool == null) return false;
@@ -1861,10 +1869,10 @@ public class Companion : BaseUnityPlugin {
     // hides them too. The only ShowHandItems call in the whole game is the player's
     // own hide key, so a bot would swing at trees with nothing in its fists forever.
     void EnsureHeld(Player player, Skills.SkillType kind) {
-        if (player.GetCurrentWeapon() != null || Time.time < handsChecked) return;
+        if (Held(player) != null || Time.time < handsChecked) return;
         handsChecked = Time.time + 1f;
         showHands?.Invoke(player, new object[] { false, false });
-        if (player.GetCurrentWeapon() != null) return;
+        if (Held(player) != null) return;
         if (kind == Skills.SkillType.None) WieldWeapon(player); else Wield(player, kind);
     }
     void SwingAt(Player player, Component what) {
