@@ -46,17 +46,19 @@ public class Companion : BaseUnityPlugin {
     Character hurtBy;      // Whoever last actually landed a hit on him.
     float hurtAt;
     Vector3 fightFrom;     // Where a self-defence fight started, so he does not chase far.
-    float threatScan, lastShout, grazeCheck, morselScan, lastBeg, morselAt, hungrySince, mendRefused;
+    float threatScan, lastShout, grazeCheck, morselScan, lastBeg, morselAt, hungrySince, mendRefused, handsChecked;
     int begged;
     ItemDrop morsel;   // Food on the ground he is walking over to collect.
     ItemDrop salvage;  // Anything on the ground he is collecting while acting as a mule.
     float salvageScan, salvageAt;
     int muled;
     int patrolStep, postsFailed;
-    bool scoring;   // Whether the current breakable counts toward the tally.
+    bool scoring;    // Whether the current breakable counts toward the tally.
+    bool mendTried;  // A bench detour already spent on this job.
 
     float patrolRing, postUntil;
     Vector3 graveSpot;
+    Vector3 dryGround;   // Last solid ground he stood on; the way out of deep water.
     bool graveKnown;
     Player deliverTo;      // Who is owed a delivery once the fetching is done.
     string deliverFilter;
@@ -80,6 +82,9 @@ public class Companion : BaseUnityPlugin {
     Vector3 previous;
     static readonly FieldInfo move = AccessTools.Field(typeof(Character), "m_moveDir");
     static readonly FieldInfo autorun = AccessTools.Field(typeof(Player), "m_autoRun");
+    // Humanoid.ShowHandItems is protected, and it is the only thing that undoes
+    // HideHandItems - which SetCraftingStation and swimming both call.
+    static readonly MethodInfo showHands = AccessTools.Method(typeof(Humanoid), "ShowHandItems", new[] { typeof(bool), typeof(bool) });
     // Spoken phrase to Valheim's emote id. Only "sit" is a held pose; the rest play once.
     static readonly Dictionary<string, string> emotes = new Dictionary<string, string> {
         {"wave", "wave"}, {"sit", "sit"}, {"sit down", "sit"}, {"challenge", "challenge"},
@@ -147,7 +152,7 @@ public class Companion : BaseUnityPlugin {
     void Halt(string reason = null) {
         job = Job.None; errand = Job.None; target = null; bed = null; sweepTarget = null; threat = null;
         asked = null; choices = null; onAnswer = null;
-        skippedDrops.Clear(); unreachable.Clear();
+        skippedDrops.Clear(); unreachable.Clear(); mendTried = false;
         deliverTo = null; deliverFilter = null; morsel = null;
         sweepFilter = null; visited.Clear(); piles.Clear(); stuckTime = 0; reachedAt = 0f;
         if (reason != null) { Logger.LogInfo("Stopped: " + reason); Say(reason); }
@@ -174,7 +179,7 @@ public class Companion : BaseUnityPlugin {
     void Forget(string why) {
         if (!asked) return;
         asked = null; choices = null; onAnswer = null;
-        skippedDrops.Clear(); unreachable.Clear();
+        skippedDrops.Clear(); unreachable.Clear(); mendTried = false;
         if (why != null) Say(why);
     }
     void Answered(string text) {
@@ -193,7 +198,7 @@ public class Companion : BaseUnityPlugin {
         if (pick == null) return;
         var act = onAnswer;
         asked = null; choices = null; onAnswer = null;
-        skippedDrops.Clear(); unreachable.Clear();
+        skippedDrops.Clear(); unreachable.Clear(); mendTried = false;
         Logger.LogInfo("Took '" + reply + "' as the answer.");
         if (pick != "no") act?.Invoke(pick); else Say("Right, I'll leave it.");
     }
@@ -1594,6 +1599,17 @@ public class Companion : BaseUnityPlugin {
     }
     // Face the target and swing on the weapon's own cadence. Leaves a little stamina
     // so Valheim's exhaustion never strands him mid-fight.
+    // Three engine paths empty his hands and none of them refill: a snapped tool is
+    // unequipped, UpdateEquipment hides them while swimming, and SetCraftingStation
+    // hides them too. The only ShowHandItems call in the whole game is the player's
+    // own hide key, so a bot would swing at trees with nothing in its fists forever.
+    void EnsureHeld(Player player, Skills.SkillType kind) {
+        if (player.GetCurrentWeapon() != null || Time.time < handsChecked) return;
+        handsChecked = Time.time + 1f;
+        showHands?.Invoke(player, new object[] { false, false });
+        if (player.GetCurrentWeapon() != null) return;
+        if (kind == Skills.SkillType.None) WieldWeapon(player); else Wield(player, kind);
+    }
     void SwingAt(Player player, Component what) {
         Vector3 aim = Edge(what, player.transform.position) - player.transform.position;
         if (aim.sqrMagnitude > 0.0001f) { player.SetLookDir(aim.normalized); player.FaceLookDirection(); }
@@ -1601,6 +1617,7 @@ public class Companion : BaseUnityPlugin {
         if (player.StartAttack(null, false)) swingUntil = Time.time + 0.4f;
     }
     void Swing(Player player) {
+        EnsureHeld(player, ToolFor(job));
         if (reachedAt == 0f) reachedAt = Time.time;
         if (Time.time - reachedAt > TargetSeconds) { Skip(); return; }
         SwingAt(player, sweepTarget);
@@ -1651,15 +1668,19 @@ public class Companion : BaseUnityPlugin {
     // Break off to mend, then come back to the same spot and carry on. Uses the same
     // errand slot as hauling, so only one detour is ever in flight.
     bool StartMend(Skills.SkillType kind) {
-        if (errand != Job.None || !IsSweep) return false;
+        if (errand != Job.None || !IsSweep || mendTried) return false;
         var me = Player.m_localPlayer;
-        var tool = me.GetCurrentWeapon();
+        // The blunt tool from the pack, not whatever is in his hands: a snapped one
+        // has already been unequipped and GetCurrentWeapon answers with his fists.
+        var tool = BestTool(kind);
         string name = tool != null ? Localization.instance.Localize(tool.m_shared.m_name) : "tool";
         Vector3 where;
-        // A station he is already standing at beats any walk. Otherwise head for a
-        // real station if one is loaded, then the surveyed camp, then a waypoint.
-        var station = StationAt(me.transform.position, 60f);
-        if (StationNear(me.transform.position, 2.5f)) where = me.transform.position;
+        // Only a station that would actually take THIS tool is worth the walk. Picking
+        // the nearest usable one sent him to a forge with a stone axe, which the forge
+        // refuses - then straight back, forever.
+        var station = tool == null ? null
+            : StationsAround(me.transform.position, 60f).FirstOrDefault(s => CanRepair(tool, s));
+        if (station && Vector3.Distance(station.transform.position, me.transform.position) <= 5f) where = me.transform.position;
         else if (station) where = station.transform.position;
         else if (campKnown) where = camp;
         else if (!places.TryGetValue("workbench", out where) && !places.TryGetValue("home", out where)) {
@@ -1671,6 +1692,7 @@ public class Companion : BaseUnityPlugin {
             return false;
         }
         errand = job;
+        mendTried = true;   // one bench detour per job, or a refusal loops
         job = Job.Mend;
         destination = where;
         sweepTarget = null; reachedAt = 0f; stuckTime = 0;
@@ -2252,6 +2274,7 @@ public class Companion : BaseUnityPlugin {
     float forgetUnreachable;
     bool winded;   // Backing off; needs real stamina back before closing again.
     void Engage(Player player) {
+        EnsureHeld(player, Skills.SkillType.None);
         if (Time.time > forgetUnreachable) { unreachable.Clear(); forgetUnreachable = Time.time + 30f; }
         Vector3 edge = Edge(threat, player.transform.position);
         // Out of stamina in melee is just free hits for the other side. Back off,
@@ -2282,6 +2305,7 @@ public class Companion : BaseUnityPlugin {
         autorun.SetValue(player, false);
         move.SetValue(player, Vector3.zero);
         if (player.IsDead()) { Halt(); return; }
+        if (!player.IsSwimming()) dryGround = player.transform.position;   // where to swim back to
         Graze(player);
         if (Threatened(player)) { Engage(player); return; }
         if (Fleeing(player)) { Flee(player); return; }
@@ -2291,12 +2315,16 @@ public class Companion : BaseUnityPlugin {
             return;
         }
         // Guard duty holds its post while hurt; every other job breaks off.
-        if (job != Job.Patrol && job != Job.Escort && player.GetHealth() < player.GetMaxHealth() * 0.3f) { Halt("I must stop here. I cannot go on safely."); return; }
-        // Swimming is fine; drowning is not. Let him cross water, and only break off
-        // when the stamina that keeps him afloat is running out.
+        // Nothing may stop him while he is afloat. Player.UpdateStamina zeroes the regen
+        // multiplier off the ground, and OnSwimming only drains while moving, so a bot
+        // halted in deep water floats there at that stamina until someone walks to the
+        // machine - no in-game order can recover him.
         if (player.IsSwimming()) {
-            if (player.GetStamina() < player.GetMaxStamina() * 0.15f) { Halt("The water's taking my strength. I'm turning back."); return; }
+            if (Time.time - lastShout > 8f) { lastShout = Time.time; Say("I'm out of my depth. Making for shore."); }
+            if (dryGround != Vector3.zero) StepToward(player, dryGround, 2.5f);
+            return;
         }
+        if (job != Job.Patrol && job != Job.Escort && player.GetHealth() < player.GetMaxHealth() * 0.3f) { Halt("I must stop here. I cannot go on safely."); return; }
         if (IsSweep && Time.time > sweepUntil) { FinishSweep("I have spent long enough at it."); return; }
         // Checked before picking a target: a full pack or a blunt tool means the next
         // thing to do is the errand, not another tree.
@@ -2321,6 +2349,7 @@ public class Companion : BaseUnityPlugin {
             case Step.Moving: return;
             default:
                 // A blocked sweep target or patrol post is skipped, not fatal.
+                if (player.IsSwimming()) return;   // never stand still afloat
                 if (IsSweep && sweepTarget) { Skip(); return; }
                 if (job == Job.Patrol) {
                     // Try the next post, but no faster than a person would, and give up
@@ -2345,8 +2374,12 @@ public class Companion : BaseUnityPlugin {
     static bool GroundAhead(Vector3 origin, Vector3 direction, float distance, int mask, out float rise, out float slope) {
         rise = 0f;
         slope = 90f;
-        Vector3 probe = origin + direction * distance + Vector3.up * 3f;
-        if (!Physics.Raycast(probe, Vector3.down, out RaycastHit hit, 7f, mask)) return false;
+        // Start just above the tallest lip he could step onto, never at head height.
+        // A probe 3 m up begins ABOVE the roof of an ordinary house, so the ray lands
+        // on the roof and every heading indoors reads as a two-metre wall - which
+        // locked him out of the one place a workbench can legally be.
+        Vector3 probe = origin + direction * distance + Vector3.up * (StepUp + 0.1f);
+        if (!Physics.Raycast(probe, Vector3.down, out RaycastHit hit, StepUp + StepDown + 0.2f, mask)) return false;
         rise = hit.point.y - origin.y;
         slope = Vector3.Angle(hit.normal, Vector3.up);
         return true;
