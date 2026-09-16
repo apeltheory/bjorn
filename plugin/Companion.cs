@@ -1837,7 +1837,7 @@ public class Companion : BaseUnityPlugin {
     // Put on the best of everything he carries. EquipItem sorts out conflicts such as
     // a two-handed weapon refusing a shield.
     void GearUp(Player player) {
-        WieldWeapon(player);
+        WieldWeapon(player);   // same judgement as any other fight: a weapon, not a tool
         var carried = player.GetInventory().GetAllItems();
         foreach (var slot in armourSlots) {
             var best = carried.Where(i => i.m_shared.m_itemType == slot && i.IsEquipable())
@@ -1931,11 +1931,19 @@ public class Companion : BaseUnityPlugin {
         return skill == Skills.SkillType.Axes || skill == Skills.SkillType.Pickaxes ||
                item.m_shared.m_buildPieces != null;
     }
+    // What it does to a creature, not to a tree. GetTotalDamage sums m_chop and
+    // m_pickaxe with the rest, and an axe's chop value is huge because that is the
+    // number that fells trees - so ranking by total damage was ranking the axe by its
+    // farming stat. Quality is already accounted for: GetDamage() passes m_quality.
+    static float CombatDamage(ItemDrop.ItemData item) {
+        var d = item.GetDamage();
+        return d.GetTotalDamage() - d.m_chop - d.m_pickaxe;
+    }
     bool WieldWeapon(Player player) {
         var best = player.GetInventory().GetAllItems()
             .Where(i => IsFightingWeapon(i) && i.IsEquipable() && Usable(i))
             .OrderByDescending(i => IsTool(i) ? 0 : 1)          // a real weapon first
-            .ThenByDescending(i => i.GetDamage().GetTotalDamage())
+            .ThenByDescending(CombatDamage)
             .FirstOrDefault();
         if (best == null) return false;
         // Already holding the right thing, including the case where the only thing he
