@@ -41,6 +41,12 @@ Bjorn runs a real Valheim client on this laptop using his own Steam account. You
    character and joins in one step — no mod involved, and nothing to click. Leave
    `VALHEIM_SERVER` blank and it starts at the menu as before, to be joined by hand.
 
+   Valheim's own handler hardcodes `FileSource.Local` when selecting the character, so a
+   character kept in **Steam Cloud** is not found and a blank one is silently created and
+   played instead. The plugin patches `FejdStartup.SelectCharacter` to look the profile up
+   and use the source it actually lives in. If you see `Loading the real one` in the log,
+   that is this working.
+
    This works for a **dedicated server**, addressed by ip:port. A world hosted from
    someone's game client is reached through Steam rather than an address, so that still
    needs joining by hand. The launcher uses whichever Steam account is signed in; it does

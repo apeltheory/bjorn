@@ -2840,6 +2840,34 @@ public class Companion : BaseUnityPlugin {
             self.Drive(Player.m_localPlayer); return false;
         }
     }
+    internal void Note(string line) { Logger.LogInfo(line); }
+
+    // Valheim's own -joinserverwithcharacter hardcodes FileSource.Local
+    // (FejdStartup.SelectCharacter(name, FileHelpers.FileSource.Local)), so a character
+    // kept in Steam Cloud is not found and a blank one is silently created and played.
+    // Look the profile up and use the source it actually lives in.
+    [HarmonyPatch(typeof(FejdStartup), "SelectCharacter")]
+    class RealCharacter {
+        static void Prefix(string fileName, ref FileHelpers.FileSource fileSource) {
+            var profiles = SaveSystem.GetAllPlayerProfiles();
+            if (profiles == null) return;
+            var match = profiles
+                .Where(p => p != null && string.Equals(p.GetFilename(), fileName, StringComparison.OrdinalIgnoreCase))
+                // A name present in both places means a stray local copy shadowing the
+                // real one, which is exactly what the hardcoded Local source creates.
+                .OrderBy(p => p.m_fileSource == FileHelpers.FileSource.Local ? 1 : 0)
+                .FirstOrDefault();
+            if (match == null) {
+                Instance?.Note("No saved character called '" + fileName + "'. Valheim will make a blank one.");
+                return;
+            }
+            if (match.m_fileSource == fileSource) return;
+            Instance?.Note("Character '" + fileName + "' lives in " + match.m_fileSource +
+                           ", not " + fileSource + ". Loading the real one.");
+            fileSource = match.m_fileSource;
+        }
+    }
+
     // Retaliation is driven by real damage, not by proximity, so a ranged attacker
     // that never comes close still gets answered.
     [HarmonyPatch(typeof(Character), "Damage")]
