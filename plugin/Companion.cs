@@ -2008,7 +2008,10 @@ public class Companion : BaseUnityPlugin {
         Halt(why + " " + char.ToUpperInvariant(what[0]) + what.Substring(1) + " is off.");
     }
     // One place where verified progress in the world is recorded.
-    void Progress() { collected++; futile = 0; }
+    // Verified progress in the world, wherever it happens. Work done between detours
+    // has to clear the strike count, or three fruitless trips end a job he has been
+    // productive on all along.
+    void Progress(int much = 1) { collected += much; if (much > 0) futile = 0; }
 
     void Mend(Player player) {
         var standing = StationsAround(player.transform.position, 5f);
@@ -2307,7 +2310,7 @@ public class Companion : BaseUnityPlugin {
                 if (!sweepTarget) {
                     // Felling a tree destroys the trunk and spawns a log, which is also
                     // a target - so only the trunk scores, or every tree counts twice.
-                    if (reachedAt != 0f && scoring) collected++;
+                    if (reachedAt != 0f && scoring) Progress();
                     reachedAt = 0f;
                     sweepTarget = NextBreakable(job, anchor, visited, player.transform.position);
                     // Felling scatters the wood well outside Valheim's 2 m pickup, so
@@ -2320,7 +2323,7 @@ public class Companion : BaseUnityPlugin {
             case Job.Fight:
                 var foe = sweepTarget as Character;
                 if (!foe || foe.IsDead()) {
-                    if (foe && foe.IsDead()) collected++;
+                    if (foe && foe.IsDead()) Progress();
                     reachedAt = 0f;
                     sweepTarget = NextFoe(anchor, sweepFilter, visited, player.transform.position);
                     if (!sweepTarget) { FinishSweep("The ground is quiet again."); return false; }
@@ -2346,7 +2349,7 @@ public class Companion : BaseUnityPlugin {
             case Job.Grave: AtGrave(player); break;
             case Job.Tend:
                 visited.Add(furnace.GetInstanceID());
-                collected += Work(furnace, player);
+                Progress(Work(furnace, player));
                 furnace = null;
                 break;
             case Job.Deliver: HandOver(player); break;
@@ -2365,7 +2368,7 @@ public class Companion : BaseUnityPlugin {
                 var pickable = (Pickable)sweepTarget;
                 visited.Add(pickable.GetInstanceID());
                 sweepTarget = null;
-                if (pickable.Interact(player, false, false)) collected++;
+                if (pickable.Interact(player, false, false)) Progress();
                 break;
             case Job.Chop:
             case Job.Mine:
@@ -2442,7 +2445,7 @@ public class Companion : BaseUnityPlugin {
             else drop.RequestOwn();
             return;
         }
-        if (player.Pickup(drop.gameObject, autoequip: false)) { Skip(); collected++; return; }
+        if (player.Pickup(drop.gameObject, autoequip: false)) { Skip(); Progress(); return; }
         // Leave it unvisited: after a run home he should come back for this one.
         sweepTarget = null; reachedAt = 0f;
         if (Loaded(player) && !(Needed(player, out var need, out var spot, out var said) && Detour(need, spot, said)))
