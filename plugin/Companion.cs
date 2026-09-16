@@ -1922,13 +1922,27 @@ public class Companion : BaseUnityPlugin {
             .OrderByDescending(i => Usable(i)).ThenByDescending(i => i.m_shared.m_toolTier)
             .ThenByDescending(i => i.m_quality).FirstOrDefault();
     }
+    // An axe or a pickaxe counts as a weapon to the engine and swings well enough, but
+    // it is a tool first: every blow struck at a greyling is durability he needs for the
+    // trees, and blunting it sends him off on a mend errand. A club beats an axe here
+    // even when the axe hits harder.
+    static bool IsTool(ItemDrop.ItemData item) {
+        var skill = item.m_shared.m_skillType;
+        return skill == Skills.SkillType.Axes || skill == Skills.SkillType.Pickaxes ||
+               item.m_shared.m_buildPieces != null;
+    }
     bool WieldWeapon(Player player) {
-        var held = Held(player);
-        if (held != null && IsFightingWeapon(held) && Usable(held)) return true;
         var best = player.GetInventory().GetAllItems()
             .Where(i => IsFightingWeapon(i) && i.IsEquipable() && Usable(i))
-            .OrderByDescending(i => i.GetDamage().GetTotalDamage()).FirstOrDefault();
-        return best != null && Equip(player, best);
+            .OrderByDescending(i => IsTool(i) ? 0 : 1)          // a real weapon first
+            .ThenByDescending(i => i.GetDamage().GetTotalDamage())
+            .FirstOrDefault();
+        if (best == null) return false;
+        // Already holding the right thing, including the case where the only thing he
+        // has to fight with IS the axe.
+        var held = Held(player);
+        if (held != null && held == best) return true;
+        return Equip(player, best);
     }
     // Walk to the nearest point on the target's own collider rather than its pivot.
     // A felled log is metres long: aiming at its centre put him far outside his own
