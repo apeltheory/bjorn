@@ -53,6 +53,8 @@ public class Companion : BaseUnityPlugin {
     float salvageScan, salvageAt;
     int muled;
     int patrolStep, postsFailed;
+    bool scoring;   // Whether the current breakable counts toward the tally.
+
     float patrolRing, postUntil;
     Vector3 graveSpot;
     bool graveKnown;
@@ -613,7 +615,7 @@ public class Companion : BaseUnityPlugin {
     }
     string WeaponWord() {
         var held = Player.m_localPlayer.GetCurrentWeapon();
-        return held != null && held.IsWeapon() ? "holding " + Localization.instance.Localize(held.m_shared.m_name) : null;
+        return held != null && IsFightingWeapon(held) ? "holding " + Localization.instance.Localize(held.m_shared.m_name) : null;
     }
     void Where() {
         var position = Player.m_localPlayer.transform.position;
@@ -962,8 +964,9 @@ public class Companion : BaseUnityPlugin {
     bool Emote(string word) {
         string emote;
         if (word == null || !emotes.TryGetValue(word.Trim(), out emote)) return false;
-        // Valheim cancels an emote the moment the character moves, so drop the job first.
-        Halt();
+        // Only a held pose needs the job stopped; Valheim cancels it the moment he
+        // moves. A one-shot plays over whatever he is doing and costs nothing.
+        if (emote == "sit") Halt("Right, I'll sit a while.");
         Player.m_localPlayer.StartEmote(emote, emote != "sit");
         return true;
     }
@@ -1381,7 +1384,7 @@ public class Companion : BaseUnityPlugin {
         foreach (var slot in armourSlots) {
             var best = carried.Where(i => i.m_shared.m_itemType == slot && i.IsEquipable())
                 .OrderByDescending(i => i.GetArmor()).ThenByDescending(i => i.m_quality).FirstOrDefault();
-            if (best != null && !best.m_equipped) player.EquipItem(best);
+            if (best != null && Usable(best)) Equip(player, best);
         }
     }
     // Walk a ring that hugs whatever has actually been built here, so the patrol
@@ -1425,43 +1428,82 @@ public class Companion : BaseUnityPlugin {
             : "I'll walk the bounds of " + name + " with my " + Localization.instance.Localize(weapon.m_shared.m_name) + " and keep it clear.");
         return true;
     }
+    // ItemData.IsWeapon() is true for torches and bows as well. A torch carries fire
+    // damage, so ordering by damage will happily send him into melee holding one.
+    static bool IsFightingWeapon(ItemDrop.ItemData item) {
+        var kind = item.m_shared.m_itemType;
+        return item.IsWeapon() && kind != ItemDrop.ItemData.ItemType.Torch && kind != ItemDrop.ItemData.ItemType.Bow;
+    }
+    static bool Usable(ItemDrop.ItemData item) {
+        return !item.m_shared.m_useDurability || item.m_durability > 0f;
+    }
+    // Humanoid.EquipItem returns false and does nothing for a broken item, mid-attack,
+    // or while swimming off the ground. Ignoring that return is how he ends up swinging
+    // at air forever with nothing in his hands and nothing to say about it.
+    bool Equip(Player player, ItemDrop.ItemData item) {
+        if (item.m_equipped) return true;
+        if (player.EquipItem(item)) return true;
+        Logger.LogInfo("Refused to equip " + Localization.instance.Localize(item.m_shared.m_name) +
+                       " (durability " + item.m_durability + ")");
+        return false;
+    }
+    ItemDrop.ItemData BestTool(Skills.SkillType kind) {
+        return Player.m_localPlayer.GetInventory().GetAllItems()
+            .Where(i => i.m_shared.m_skillType == kind && i.IsEquipable())
+            .OrderByDescending(i => Usable(i)).ThenByDescending(i => i.m_shared.m_toolTier)
+            .ThenByDescending(i => i.m_quality).FirstOrDefault();
+    }
     bool WieldWeapon(Player player) {
         var held = player.GetCurrentWeapon();
-        if (held != null && held.IsWeapon()) return true;
+        if (held != null && IsFightingWeapon(held) && Usable(held)) return true;
         var best = player.GetInventory().GetAllItems()
-            .Where(i => i.IsWeapon() && i.IsEquipable())
+            .Where(i => IsFightingWeapon(i) && i.IsEquipable() && Usable(i))
             .OrderByDescending(i => i.GetDamage().GetTotalDamage()).FirstOrDefault();
-        if (best == null) return false;
-        player.EquipItem(best);
-        return true;
+        return best != null && Equip(player, best);
     }
     // Walk to the nearest point on the target's own collider rather than its pivot.
     // A felled log is metres long: aiming at its centre put him far outside his own
     // swing, so the axe never connected.
     static Vector3 Edge(Component what, Vector3 from) {
+        Vector3 best = Vector3.zero;
+        float nearest = float.MaxValue;
         foreach (var collider in what.GetComponentsInChildren<Collider>()) {
             if (!collider || !collider.enabled || collider.isTrigger) continue;
             var mesh = collider as MeshCollider;
             if (mesh != null && !mesh.convex) continue;  // ClosestPoint is undefined on these.
-            return collider.ClosestPoint(from);
+            Vector3 point = collider.ClosestPoint(from);
+            float gap = Vector3.Distance(point, from);
+            if (gap < nearest) { nearest = gap; best = point; }
         }
-        return what.transform.position;
+        if (nearest < float.MaxValue) return best;
+        // Nothing usable: aim at the nearest child instead of the pivot, which on a
+        // rock or a felled log sits inside the mesh where he can never stand.
+        foreach (var part in what.GetComponentsInChildren<Transform>()) {
+            float gap = Vector3.Distance(part.position, from);
+            if (gap < nearest) { nearest = gap; best = part.position; }
+        }
+        return nearest < float.MaxValue ? best : what.transform.position;
     }
+    // Measured against Edge(), so this is the weapon's own reach to the target's
+    // surface. Atgeirs and polearms genuinely outrange 2.8 m.
     static float Reach(Player player, Component what) {
         var weapon = player.GetCurrentWeapon();
         float swing = weapon?.m_shared?.m_attack != null ? weapon.m_shared.m_attack.m_attackRange : 2f;
-        return Mathf.Clamp(swing, 1.6f, 2.8f);
+        return Mathf.Clamp(swing, 1.6f, 4f);
     }
     // Picks up (or keeps) the best tool of a kind. Returns false when there is none.
     bool Wield(Player player, Skills.SkillType kind) {
         var held = player.GetCurrentWeapon();
-        if (held != null && held.m_shared.m_skillType == kind) return true;
-        var tool = player.GetInventory().GetAllItems()
-            .Where(i => i.m_shared.m_skillType == kind && i.IsEquipable())
-            .OrderByDescending(i => i.m_shared.m_toolTier).ThenByDescending(i => i.m_quality).FirstOrDefault();
+        if (held != null && held.m_shared.m_skillType == kind && Usable(held)) return true;
+        var tool = BestTool(kind);
         if (tool == null) return false;
-        player.EquipItem(tool);
-        return true;
+        if (!Usable(tool)) {
+            // Valheim unequips a tool the moment it breaks, so this is otherwise
+            // invisible: no tool in hand, nothing said, and nothing happening.
+            Say("My " + Localization.instance.Localize(tool.m_shared.m_name) + " has snapped. Mend it and I'll get back to work.");
+            return false;
+        }
+        return Equip(player, tool);
     }
     // Face the target and swing on the weapon's own cadence. Leaves a little stamina
     // so Valheim's exhaustion never strands him mid-fight.
@@ -1512,8 +1554,9 @@ public class Companion : BaseUnityPlugin {
     // True when the wielded tool of that kind is nearly spent and worth mending.
     bool Blunt(Skills.SkillType kind) {
         if (kind == Skills.SkillType.None) return false;
-        var tool = Player.m_localPlayer.GetCurrentWeapon();
-        if (tool == null || tool.m_shared.m_skillType != kind) return false;
+        // Inventory, not the hands: a tool that has already broken is unequipped.
+        var tool = BestTool(kind);
+        if (tool == null) return false;
         if (!tool.m_shared.m_useDurability || !tool.m_shared.m_canBeReparied) return false;
         float max = tool.GetMaxDurability();
         return max > 0f && tool.m_durability / max <= 0.15f;
@@ -1812,8 +1855,10 @@ public class Companion : BaseUnityPlugin {
                 return true;
             case Job.Resume:
                 // A mule run ends back at whoever he is carrying for, not at a spot.
-                if ((errand == Job.Mule || errand == Job.Come) && target) { goal = target.transform.position; arrival = 4f; }
-                else goal = anchor;
+                if (errand == Job.Mule || errand == Job.Come) {
+                    if (!target) { Halt("Unloaded, but I've lost you."); return false; }
+                    goal = target.transform.position; arrival = 4f;
+                } else goal = anchor;
                 return true;
             case Job.Patrol:
                 goal = destination; arrival = 2.5f;
@@ -1845,15 +1890,16 @@ public class Companion : BaseUnityPlugin {
             case Job.Chop:
             case Job.Mine:
                 if (!sweepTarget) {
-                    // Valheim destroys a tree or rock outright when it breaks, so a
-                    // target that vanishes after we reached it is one we finished.
-                    if (reachedAt != 0f) collected++;
+                    // Felling a tree destroys the trunk and spawns a log, which is also
+                    // a target - so only the trunk scores, or every tree counts twice.
+                    if (reachedAt != 0f && scoring) collected++;
                     reachedAt = 0f;
                     sweepTarget = NextBreakable(job, anchor, visited, player.transform.position);
                     // Felling scatters the wood well outside Valheim's 2 m pickup, so
                     // the job is not done until he has swept up what he knocked down.
                     if (!sweepTarget) { GleanOrFinish(job == Job.Chop ? "No tree is left standing here." : "No rock is left to break here."); return false; }
                 }
+                scoring = sweepTarget is TreeBase || sweepTarget is MineRock || sweepTarget is MineRock5;
                 goal = Edge(sweepTarget, player.transform.position); arrival = Reach(player, sweepTarget);
                 return true;
             case Job.Fight:
@@ -2101,12 +2147,14 @@ public class Companion : BaseUnityPlugin {
     // Cleared periodically, because terrain and the foe both move.
     readonly HashSet<int> unreachable = new HashSet<int>();
     float forgetUnreachable;
+    bool winded;   // Backing off; needs real stamina back before closing again.
     void Engage(Player player) {
         if (Time.time > forgetUnreachable) { unreachable.Clear(); forgetUnreachable = Time.time + 30f; }
         Vector3 edge = Edge(threat, player.transform.position);
         // Out of stamina in melee is just free hits for the other side. Back off,
         // let it come back, and close again when there is something to swing with.
-        if (player.GetStamina() < 8f && player.GetMaxStamina() > 0f) {
+        if (player.GetStamina() < (winded ? 25f : 8f) && player.GetMaxStamina() > 0f) {
+            winded = true;
             Vector3 away = player.transform.position - edge; away.y = 0;
             if (away.sqrMagnitude > 0.0001f && away.magnitude < Reach(player, threat) * 2.5f) {
                 SwingAt(player, threat);  // keep facing it while giving ground
@@ -2114,6 +2162,7 @@ public class Companion : BaseUnityPlugin {
                 return;
             }
         }
+        winded = false;
         var step = StepToward(player, edge, Reach(player, threat));
         if (step == Step.Arrived) { SwingAt(player, threat); return; }
         // Cannot reach it: remember that, so the next scan does not pick it straight
