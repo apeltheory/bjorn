@@ -26,6 +26,12 @@ Bjorn runs a real Valheim client on this laptop using his own Steam account. You
 4. **He can join by himself.** Put your server in `.env` and the launcher takes it from there:
 
    ```sh
+   python3 scripts/set-server.py        # prompts; the password stays invisible
+   ```
+
+   or by hand in `.env`:
+
+   ```sh
    VALHEIM_SERVER=192.168.1.50:2456     # a dedicated server, as ip:port
    VALHEIM_CHARACTER=Bjorn
    VALHEIM_PASSWORD=yourpassword
@@ -439,6 +445,7 @@ Other than the in-game F8 toggle, edit configuration while the game is closed.
 | `scripts/game.sh` | Launch the modded client |
 | `scripts/brain.sh` | Load `.env` and run the planner |
 | `scripts/set-key.py` | Privately save an API key |
+| `scripts/set-server.py` | Save the server to join, with the password entered invisibly |
 | `scripts/smoke.py` | Test authentication and a basic order against the running bridge |
 | `scripts/check-api.py` | Make a small direct Anthropic connection test |
 | `scripts/check-commands.py` | Static checks on the chat dispatch: unreachable commands, duplicates, truncated chat lines |
