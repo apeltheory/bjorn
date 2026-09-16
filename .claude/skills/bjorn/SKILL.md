@@ -1,0 +1,73 @@
+---
+name: bjorn
+description: Start, stop, rebuild or check the Bjorn Valheim companion — the planner service and the modded game client. Use whenever asked to launch, kill, restart, stage or check on Bjorn, the bot, the planner, the bridge, or Valheim itself; or after changing plugin/Companion.cs or brain/server.py and the change needs to reach the running game.
+---
+
+# Running Bjorn
+
+One entry point for everything: `scripts/bjorn.sh`. Prefer it over calling
+`brain.sh`, `game.sh` or `prepare.py` directly — it handles ordering, staging and
+the checks those scripts do not.
+
+```sh
+cd /home/apel-xps/Work/valheim-companion
+
+./scripts/bjorn.sh status          # what is running, plugin version, last log line
+./scripts/bjorn.sh start           # planner, then the game
+./scripts/bjorn.sh stop            # game (cleanly), then planner
+./scripts/bjorn.sh restart
+./scripts/bjorn.sh build           # build + tests + dispatch check + stage
+./scripts/bjorn.sh logs 60         # tail the in-game plugin log
+
+./scripts/bjorn.sh planner start|stop|restart
+./scripts/bjorn.sh game start|stop|restart
+```
+
+## Rules that matter
+
+**Always `status` first.** It is cheap and tells you whether you are about to
+start a second copy or kill something the user is mid-session with.
+
+**Never stage a plugin while Valheim is running.** The DLL is in use and the game
+loads it once at startup. `build` detects this and refuses to stage, telling you to
+stop the game first. The sequence after editing `plugin/Companion.cs` is:
+
+```sh
+./scripts/bjorn.sh game stop
+./scripts/bjorn.sh build
+./scripts/bjorn.sh game start
+```
+
+**Stopping Valheim is not free.** `game stop` sends SIGTERM and waits up to 30
+seconds so Unity runs its normal shutdown, which is what saves the world and
+character. If it does not exit in time the script leaves it alone rather than
+forcing it — do not `kill -9` a running Valheim, it can lose progress. Tell the
+user instead.
+
+**Restart the planner after editing `brain/server.py` or `.env`.** It reads both
+once at startup. `MAX_API_CALLS` also resets on restart, so a restart refills the
+request budget.
+
+**The planner is not required** for direct commands — the plugin answers about
+forty phrases itself. It is only needed for orders that fall through to Claude.
+If it will not start, say so and carry on; do not treat it as fatal.
+
+## Checking a change reached the game
+
+`status` prints the plugin version in source and when the staged DLL was last
+written. If the staged time predates your edit, it did not get staged.
+
+In game, `Bjorn, self test` is the fastest confirmation the new build is live: one
+order, six lines back covering version, known places, surroundings, tool wear,
+belly and whether the planner is reachable. It touches nothing.
+
+## Where things are
+
+| Path | What |
+| --- | --- |
+| `runtime/logs/planner.log` | Planner stdout, including the startup line |
+| `runtime/logs/game.log` | Launcher stdout |
+| `runtime/game/BepInEx/LogOutput.log` | The plugin's own log — where `Logger.LogInfo` goes |
+| `runtime/unity.log` | Unity log |
+
+Do not read or print `.env` or `runtime/bridge.token`.
