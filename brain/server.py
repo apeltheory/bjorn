@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ACTIONS = {
     'follow', 'come', 'escort', 'mule', 'haul', 'stay', 'inventory', 'status', 'where', 'scan',
-    'remember_home', 'go_home', 'places', 'claim_bed', 'go_to_bed', 'self_test',
+    'remember_home', 'go_home', 'places', 'claim_bed', 'go_to_bed', 'self_test', 'survey', 'camp',
     'eat', 'equip', 'unequip', 'drop', 'drop_all', 'pile', 'bring',
     'gather', 'harvest', 'chop', 'mine', 'fight', 'guard',
     'deposit', 'withdraw', 'craft', 'repair', 'feed_fire',
@@ -25,6 +25,7 @@ Choose exactly one action:
 - mule: walk with the speaker and pick up everything they leave on the ground, running full loads to the home chest by himself. Right for "carry my loot", "be my pack mule", "follow me and grab what I drop".
 - haul: take what he is carrying to the home chest now, then come back. Right for "take it home", "go unload", "drop that at base".
 - pile: dump the materials he is carrying on the ground where he stands, keeping his tools, food and gear. This is the answer when there is no chest or the chests are full. Right for "dump it", "just drop it here", "leave it on the floor".
+- The camp: survey looks over the base he is standing in and learns its centre, extent, chests, beds, fires and stations, so he can guard all of it and mend without being told where a bench is. camp reports what he learned. Right for "learn the camp", "what is in the camp", "how big is our base".
 - Named places: remember_home saves where he stands under the name in `item` (default "home"); go_home walks to the name in `item`, or home when empty; places lists what he knows. The state lists his known place names. "home" is special: it is where he unloads a full pack.
 - Reporting: inventory (carried items), status (health, stamina, food), where (position and biome), scan (what is nearby), self_test (a full readout of his places, surroundings, tools, belly and whether he can reach you through this planner - the right answer to "are you working?" or "what is wrong").
 - Work near where he stands: gather (dropped items), harvest (berries and other pickables), chop (fell trees with an axe), mine (break rock with a pickaxe), fight (attack hostile creatures). If he has a home with a chest, a work order keeps going by itself: when his pack fills he walks the load home, empties it into the chest, walks back, and carries on until nothing is left.
@@ -70,6 +71,7 @@ DIRECT = {
     'where are you': 'where', 'location': 'where',
     'look around': 'scan', 'what do you see': 'scan', 'scan': 'scan',
     'self test': 'self_test', 'sound off': 'self_test', 'are you working': 'self_test',
+    'learn the camp': 'survey', 'survey the camp': 'survey', 'what is in the camp': 'camp',
     'go home': 'go_home', 'return home': 'go_home',
     'what places do you know': 'places', 'list places': 'places',
     'go to bed': 'go_to_bed', 'sleep': 'go_to_bed',
@@ -84,7 +86,7 @@ DIRECT = {
     'repair': 'repair', 'mend': 'repair', 'repair your stuff': 'repair', 'fix your gear': 'repair',
     'eat': 'eat', 'eat up': 'eat', 'eat something': 'eat',
 }
-QUIET = {'inventory', 'status', 'where', 'scan', 'places', 'self_test'}
+QUIET = {'inventory', 'status', 'where', 'scan', 'places', 'self_test', 'survey', 'camp'}
 
 
 def offline(message):

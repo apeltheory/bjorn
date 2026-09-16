@@ -50,11 +50,28 @@ starting with `Bjorn, self test`.
 
 ## Next up
 
-- **Camp awareness** (asked, not built). See below.
 - **Ambiguity questions** — `eat meat` with cooked, serpent and lox in the pack currently
   picks one silently. The asking primitive is built; wiring it into item lookup is next.
+- **Locomotion** — a third workflow is measuring sprint, jump, stuck detection and arrival
+  against the real character controller.
 
-## Camp awareness — how it would work
+## Camp awareness — built
+
+`learn the camp` surveys out to 90 m using `Piece.GetAllPiecesInRadius` (a public registry
+of every placed piece — no scene scanning), centres on the pieces rather than on where he
+happens to stand, measures the extent, and saves both to config so he still knows the shape
+of the base when most of it is unloaded. `what's in the camp` reports chests, beds, fires,
+stations and a rough building count from clustering.
+
+It changes three behaviours: `guard the camp` now patrols a ring sized to the **real** camp
+instead of a fixed 30 m, watches the whole of it for intruders, mending finds the nearest
+actual crafting station within 60 m instead of needing a hand-placed `workbench` waypoint,
+and `self test` reports whether he knows the camp at all.
+
+Still manual: `home` remains the specific spot he unloads at, because a camp centre is not
+where the chests are. Worth revisiting once it has run.
+
+### The API, for reference
 
 The game gives us more than expected:
 

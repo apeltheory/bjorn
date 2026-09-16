@@ -22,7 +22,11 @@ public class Companion : BaseUnityPlugin {
     // Outcome of one tick of walking toward a point.
     enum Step { Moving, Arrived, Blocked, Stuck }
     const float TargetSeconds = 30f; // Abandon one tree, rock, or foe that will not fall.
-    ConfigEntry<string> botName, tokenFile, homePosition, bedPosition, waypoints;
+    ConfigEntry<string> botName, tokenFile, homePosition, bedPosition, waypoints, campCentre;
+    ConfigEntry<float> campRadius;
+    Vector3 camp;
+    float campSpan;
+    bool campKnown;
     ConfigEntry<float> jobRadius, jobMinutes, guardRadius;
     ConfigEntry<bool> botEnabled, defendSelf, pileOver;
     ConfigEntry<KeyboardShortcut> toggleKey;
@@ -62,6 +66,10 @@ public class Companion : BaseUnityPlugin {
     bool busy;
     int generation;
     float lastOrder, lastDeaf, lastBanter, stuckTime;
+    Player asked;            // Who he put a question to, and is listening to.
+    string[] choices;        // Accepted answers; null means yes or no.
+    Action<string> onAnswer;
+    float askedUntil;
     int bantered;
     float avoidUntil;
     float jumpUntil;
@@ -95,17 +103,21 @@ public class Companion : BaseUnityPlugin {
         waypoints = Config.Bind("Bot", "Waypoints", "", "Named places as name=x,y,z separated by semicolons. 'home' is where he unloads a full pack.");
         jobRadius = Config.Bind("Bot", "JobRadius", 25f, "How far from the spot he was ordered a gathering job may range, in metres (5-100).");
         jobMinutes = Config.Bind("Bot", "JobMinutes", 15f, "How long one load of a gathering job may take before he gives up, in minutes (0.5-120). The clock restarts after each run home.");
+        campCentre = Config.Bind("Bot", "CampCentre", "", "Centre of the surveyed camp, written by 'learn the camp'.");
+        campRadius = Config.Bind("Bot", "CampRadius", 30f, "How far the surveyed camp reaches from its centre, in metres.");
         guardRadius = Config.Bind("Bot", "GuardRadius", 30f, "How far from a camp's centre counts as inside it while on guard, in metres (8-120).");
         pileOver = Config.Bind("Bot", "PileWhenNoChest", true, "On a run home, leave anything the chest cannot take on the ground rather than stopping the job. Dropped items persist in Valheim.");
         defendSelf = Config.Bind("Bot", "DefendSelf", true, "Fight back at anything hostile that comes close while doing other work. Guard duty ignores this and always fights.");
         tokenFile = Config.Bind("Bridge", "TokenFile", "/home/apel-xps/Work/valheim-companion/runtime/bridge.token", "Local bridge token file.");
         LoadPlaces();
+        LoadCamp();
         harmony = new Harmony("local.bjorn.companion");
         harmony.PatchAll();
         Application.runInBackground = true;
         Logger.LogInfo("Bjorn ready. Any nearby player can address orders to Bjorn.");
     }
     void Update() {
+        if (asked && Time.unscaledTime >= askedUntil) Forget("No matter, then.");
         var player = Player.m_localPlayer;
         if (!player || !Application.isFocused || !toggleKey.Value.IsDown()) return;
         generation++; // Reject late decisions even if bot mode is re-enabled immediately.
@@ -127,6 +139,7 @@ public class Companion : BaseUnityPlugin {
     }
     void Halt(string reason = null) {
         job = Job.None; errand = Job.None; target = null; bed = null; sweepTarget = null; threat = null;
+        asked = null; choices = null; onAnswer = null;
         deliverTo = null; deliverFilter = null; morsel = null;
         sweepFilter = null; visited.Clear(); piles.Clear(); stuckTime = 0; reachedAt = 0f;
         if (reason != null) { Logger.LogInfo("Stopped: " + reason); Say(reason); }
@@ -134,6 +147,46 @@ public class Companion : BaseUnityPlugin {
     // Clear any running job and start a fresh one from the bot's current spot.
     void Begin(Job next) { Halt(); job = next; previous = Player.m_localPlayer.transform.position; }
     static bool Any(string value, params string[] options) { return options.Contains(value); }
+
+    // ---- Asking, and listening for the answer ----------------------------
+    //
+    // When he asks something, the next reply from that same player counts even if it
+    // does not start with his name. The window is deliberately narrow: one player,
+    // 25 seconds, one answer, and the answer can ONLY resolve the question he asked -
+    // it cannot start an arbitrary job. Anything that does not parse as an answer is
+    // ignored and the window stays open, so ordinary chat is never hijacked.
+    void AskFor(Player who, string question, string[] options, Action<string> answer) {
+        if (!who) return;
+        asked = who; choices = options; onAnswer = answer;
+        askedUntil = Time.unscaledTime + 25f;
+        Say(question);
+    }
+    static readonly string[] yesWords = { "yes", "aye", "yeah", "yep", "sure", "ok", "okay", "do it", "go on", "go ahead", "please" };
+    static readonly string[] noWords = { "no", "nay", "nope", "dont", "don't", "leave it", "forget it", "never mind", "nevermind" };
+    void Forget(string why) {
+        if (!asked) return;
+        asked = null; choices = null; onAnswer = null;
+        if (why != null) Say(why);
+    }
+    void Answered(string text) {
+        string reply = Bare(text);
+        if (reply == null) return;
+        string pick = null;
+        if (choices == null) {
+            if (Any(reply, yesWords)) pick = "yes";
+            else if (Any(reply, noWords)) pick = "no";
+        } else {
+            // "cooked" answers "Cooked meat"; so does the whole name.
+            pick = choices.FirstOrDefault(c => KeyMatches(c, Key(reply)) || KeyMatches(reply, Key(c)));
+            if (pick == null && Any(reply, noWords)) { Forget("As you like."); return; }
+        }
+        // Not an answer to what he asked: leave it alone and keep listening.
+        if (pick == null) return;
+        var act = onAnswer;
+        asked = null; choices = null; onAnswer = null;
+        Logger.LogInfo("Took '" + reply + "' as the answer.");
+        if (pick != "no") act?.Invoke(pick); else Say("Right, I'll leave it.");
+    }
     // Abuse gets answered in kind. Matched on whole words so "assess" and "Scunthorpe"
     // do not set him off.
     static readonly HashSet<string> curses = new HashSet<string> {
@@ -191,8 +244,10 @@ public class Companion : BaseUnityPlugin {
         var me = Player.m_localPlayer;
         if (text == null) return;
         var prefix = botName.Value;
-        if (!text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || text.Length <= prefix.Length ||
-            " ,:".IndexOf(text[prefix.Length]) < 0) return;
+        bool addressed = text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && text.Length > prefix.Length &&
+                         " ,:".IndexOf(text[prefix.Length]) >= 0;
+        bool listening = asked && Time.unscaledTime < askedUntil;
+        if (!addressed && !listening) return;
         if (!Active) {
             Logger.LogInfo("Addressed order ignored: bot is in manual mode or not spawned.");
             return;
@@ -211,6 +266,13 @@ public class Companion : BaseUnityPlugin {
             Logger.LogInfo("Addressed order ignored: speaking player is not loaded nearby.");
             return;
         }
+        if (!addressed) {
+            // Only the person he asked can answer, and only that question.
+            if (speaker == asked) Answered(text);
+            return;
+        }
+        // A fresh order by name supersedes whatever he was waiting to hear.
+        Forget(null);
         var order = text.Substring(prefix.Length).Trim(' ', ',', ':');
         if (order.Length == 0 || order.Length > 500) return;
         var simple = order.ToLowerInvariant().TrimEnd('.', '!');
@@ -246,6 +308,8 @@ public class Companion : BaseUnityPlugin {
         if (Any(plain, "where are you", "where", "location", "position")) { Where(); return; }
         if (Any(plain, "look around", "what do you see", "scan", "what is nearby", "anything nearby")) { Scan(); return; }
         if (Any(plain, "self test", "selftest", "sound off", "check yourself", "diagnostics", "are you working")) { SelfTest(); return; }
+        if (Any(simple, "learn the camp", "survey the camp", "look over the camp", "study the camp", "learn this place")) { Survey(true); return; }
+        if (Any(plain, "what is in the camp", "whats in the camp", "describe the camp", "tell me about the camp", "how big is the camp")) { CampReport(null); return; }
         if (Any(simple, "set home")) { RememberPlace("home"); return; }
         if (Any(plain, "what places do you know", "list places", "places", "waypoints", "where can you go")) { ListPlaces(); return; }
         // Bed phrases are matched before the "go to <place>" and "remember this as
@@ -484,6 +548,9 @@ public class Companion : BaseUnityPlugin {
                 .Select(x => x.Key + " " + Mathf.RoundToInt(Vector3.Distance(here, x.Value)) + " paces " + Compass(x.Value - here)))
               + (TryParsePosition(bedPosition.Value, out _) ? ". Bed remembered." : ". No bed."));
 
+        Say(campKnown
+            ? "I know this camp: " + Mathf.RoundToInt(campSpan * 2f) + " paces across, centre " + Mathf.RoundToInt(Vector3.Distance(here, camp)) + " paces " + Compass(camp - here) + "."
+            : "I've not surveyed a camp. Say 'learn the camp' standing in it.");
         int chests = Nearby<Container>(here, 8f).Count();
         var station = me.GetCurrentCraftingStation();
         Say("Around me: " + (chests == 0 ? "no chest" : chests + (chests == 1 ? " chest" : " chests")) + ", " +
@@ -1137,6 +1204,93 @@ public class Companion : BaseUnityPlugin {
         if (places.ContainsKey("home")) GoToPlace("home"); else Halt();
     }
 
+    // ---- Knowing the camp ------------------------------------------------
+    //
+    // Valheim keeps a registry of every placed piece, so he can survey a base rather
+    // than being told about it one waypoint at a time. The survey is saved, so he
+    // still knows the shape of the camp when most of it is out of loading range.
+
+    void LoadCamp() {
+        campKnown = TryParsePosition(campCentre.Value, out camp);
+        if (campKnown) campSpan = Mathf.Clamp(campRadius.Value, 8f, 120f);
+    }
+    // Groups pieces that are within `reach` of each other, and returns the size of
+    // each group. Used only to say roughly how many buildings there are, so a rough
+    // answer is fine; it is never used to decide anything.
+    static List<int> Clusters(List<Vector3> points, float reach) {
+        var sizes = new List<int>();
+        var taken = new bool[points.Count];
+        var queue = new List<int>();
+        for (int seed = 0; seed < points.Count; seed++) {
+            if (taken[seed]) continue;
+            taken[seed] = true;
+            queue.Clear();
+            queue.Add(seed);
+            int size = 0;
+            for (int at = 0; at < queue.Count; at++) {
+                size++;
+                for (int other = 0; other < points.Count; other++) {
+                    if (taken[other] || Vector3.Distance(points[queue[at]], points[other]) > reach) continue;
+                    taken[other] = true;
+                    queue.Add(other);
+                }
+            }
+            sizes.Add(size);
+        }
+        return sizes;
+    }
+    bool Survey(bool speak) {
+        var me = Player.m_localPlayer;
+        var here = me.transform.position;
+        var built = new List<Piece>();
+        Piece.GetAllPiecesInRadius(here, 90f, built);
+        built = built.Where(b => b && b.GetComponent<ZNetView>()).ToList();
+        if (built.Count < 5) {
+            if (speak) Say("I see nothing built here worth calling a camp.");
+            return false;
+        }
+        // Centre on the pieces themselves, not on where he happens to be standing.
+        Vector3 middle = Vector3.zero;
+        foreach (var piece in built) middle += piece.transform.position;
+        middle /= built.Count;
+        middle.y = here.y;
+        float reach = built.Max(b => Vector3.Distance(new Vector3(b.transform.position.x, middle.y, b.transform.position.z), middle));
+        camp = middle;
+        campSpan = Mathf.Clamp(reach + 5f, 8f, 120f);
+        campKnown = true;
+        campCentre.Value = Vector3ToConfig(camp);
+        campRadius.Value = campSpan;
+        Config.Save();
+        if (speak) CampReport(built);
+        Logger.LogInfo("Surveyed camp: " + built.Count + " pieces, span " + campSpan);
+        return true;
+    }
+    void CampReport(List<Piece> built) {
+        if (built == null) {
+            if (!campKnown) { Say("I've not looked over the camp yet. Say 'learn the camp' while you're standing in it."); return; }
+            built = new List<Piece>();
+            Piece.GetAllPiecesInRadius(camp, campSpan + 5f, built);
+        }
+        // Clusters of a handful of pieces are a wall or a fence, not a building.
+        int houses = Clusters(built.Select(b => b.transform.position).ToList(), 6f).Count(size => size >= 15);
+        Say("Your camp runs " + Mathf.RoundToInt(campSpan * 2f) + " paces across, " + built.Count + " pieces" +
+            (houses > 0 ? ", about " + houses + (houses == 1 ? " building." : " buildings.") : "."));
+        var stations = Nearby<CraftingStation>(camp, campSpan).GroupBy(s => Localization.instance.Localize(s.m_name))
+            .Select(g => g.Count() + " " + g.Key).ToList();
+        Say("In it: " + Nearby<Container>(camp, campSpan).Count() + " chests, " +
+            Nearby<Bed>(camp, campSpan).Count() + " beds, " +
+            Nearby<Fireplace>(camp, campSpan).Count() + " fires" +
+            (stations.Count > 0 ? ", " + string.Join(", ", stations) + "." : ", no stations."));
+        Say("I'll guard all of it if you say 'guard the camp', and mend at the nearest bench without being told where.");
+    }
+    // The centre he should treat as base: the surveyed camp if he has one, else the
+    // home waypoint, else where he stands.
+    bool CampOr(out Vector3 centre, out float span, out string name) {
+        if (campKnown) { centre = camp; span = campSpan; name = "the camp"; return true; }
+        if (places.TryGetValue("home", out centre)) { span = GuardSpan; name = "home"; return true; }
+        centre = Player.m_localPlayer.transform.position; span = GuardSpan; name = "this ground"; return false;
+    }
+
     // ---- Guard duty ------------------------------------------------------
 
     static readonly ItemDrop.ItemData.ItemType[] armourSlots = {
@@ -1173,16 +1327,19 @@ public class Companion : BaseUnityPlugin {
         Vector3 centre;
         string name;
         if (raw == null) {
-            // No place named: guard home if he has one, otherwise right where he stands.
-            if (places.TryGetValue("home", out centre)) name = "home";
-            else { centre = me.transform.position; name = "this ground"; }
+            // Prefer the surveyed camp: it knows its real extent, so the patrol covers
+            // the whole base instead of a fixed ring around one point.
+            if (!campKnown) Survey(false);
+            CampOr(out centre, out _, out name);
         } else {
             name = PlaceName(raw);
             if (name == null || !places.TryGetValue(name, out centre)) return false;
         }
         Begin(Job.Patrol);
         anchor = centre;
-        patrolRing = CampRadius(centre);
+        // A surveyed camp knows how big it is; otherwise fall back to measuring the
+        // buildings near the point he was given.
+        patrolRing = raw == null && campKnown ? Mathf.Clamp(campSpan * 0.85f, 6f, GuardSpan * 2f) : CampRadius(centre);
         patrolStep = 0;
         NextPost();
         GearUp(me);
@@ -1293,10 +1450,14 @@ public class Companion : BaseUnityPlugin {
         var tool = me.GetCurrentWeapon();
         string name = tool != null ? Localization.instance.Localize(tool.m_shared.m_name) : "tool";
         Vector3 where;
-        // A station he is already standing at beats any walk.
+        // A station he is already standing at beats any walk. Otherwise head for a
+        // real station if one is loaded, then the surveyed camp, then a waypoint.
+        var station = Nearest<CraftingStation>(me.transform.position, 60f);
         if (me.GetCurrentCraftingStation() != null) where = me.transform.position;
+        else if (station) where = station.transform.position;
+        else if (campKnown) where = camp;
         else if (!places.TryGetValue("workbench", out where) && !places.TryGetValue("home", out where)) {
-            Say("My " + name + " is nearly spent and I know no place to mend it. Say 'remember this as workbench' at one.");
+            Say("My " + name + " is nearly spent and I know no bench to mend it at. Say 'learn the camp' in your base.");
             return false;
         }
         errand = job;
@@ -1482,6 +1643,8 @@ public class Companion : BaseUnityPlugin {
                 case "where": Where(); break;
                 case "scan": Scan(); break;
                 case "self_test": SelfTest(); break;
+                case "survey": Survey(true); break;
+                case "camp": CampReport(null); break;
                 case "remember_home": RememberPlace(item ?? "home"); break;
                 case "go_home": if (item == null) GoHome(); else if (!GoToPlace(item)) Say("I know no place called that."); break;
                 case "places": ListPlaces(); break;
@@ -1771,7 +1934,7 @@ public class Companion : BaseUnityPlugin {
         // is fighting rather than whatever happens to be nearest him. On guard duty he
         // watches the whole camp. Otherwise he only answers what comes near him.
         Vector3 watchFrom = guarding ? anchor : (escorting ? target.transform.position : player.transform.position);
-        float watch = guarding ? GuardSpan : (escorting ? 22f : 12f);
+        float watch = guarding ? Mathf.Max(GuardSpan, patrolRing + 8f) : (escorting ? 22f : 12f);
         var found = Character.GetAllCharacters()
             .Where(c => c && c != player && !c.IsDead() && !c.IsPlayer() && !c.IsTamed() && BaseAI.IsEnemy(player, c) &&
                         Vector3.Distance(c.transform.position, watchFrom) <= watch)
