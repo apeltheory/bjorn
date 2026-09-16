@@ -100,6 +100,8 @@ public class Companion : BaseUnityPlugin {
     bool busy;
     int generation;
     float lastOrder, lastDeaf, lastBanter, lastExplain, doorUntil;
+    int lastDoor, doorTries;
+    readonly HashSet<int> skippedDoors = new HashSet<int>();
     Player asked;            // Who he put a question to, and is listening to.
     string[] choices;        // Accepted answers; null means yes or no.
     Action<string> onAnswer;
@@ -180,7 +182,7 @@ public class Companion : BaseUnityPlugin {
         FreshAll();
         furnace = null; lastRound = 0;
         asked = null; choices = null; onAnswer = null;
-        skippedDrops.Clear(); unreachable.Clear();
+        skippedDrops.Clear(); unreachable.Clear(); skippedDoors.Clear();
         deliverTo = null; deliverFilter = null; morsel = null;
         // piles IS cleared here. No live chain runs through Halt - GleanOrFinish,
         // AfterDetour and Unload all change job without it, and FinishSweep's only
@@ -2596,6 +2598,14 @@ public class Companion : BaseUnityPlugin {
         // while following, have you walk back into his arrival radius, and then be
         // declared wedged over a stall that had already cleared.
         if (delta.magnitude < arrival) { s.previous = player.transform.position; s.stuckTime = 0f; return Step.Arrived; }
+        // Try the handle whenever the straight line is barred - NOT only when every
+        // heading is. A door is a narrow thing: he can nearly always sidestep it, so
+        // SelectWalkDirection returns a way round and the old check, gated on total
+        // blockage, effectively never ran. Walking around a house instead of through it
+        // is exactly the behaviour that looked like "he can't open doors".
+        int doorMask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain");
+        if (!IsWalkable(player.transform.position, delta.normalized, doorMask) && TryDoor(player, delta))
+            return Step.Moving;
         var direction = SelectWalkDirection(s, player.transform.position, delta.normalized);
         if (direction == Vector3.zero) {
             // Try the handle before declaring the way shut.
@@ -2864,6 +2874,7 @@ public class Companion : BaseUnityPlugin {
         if (heading.sqrMagnitude < 0.01f) return false;
         heading.Normalize();
         var door = Nearby<Door>(player.transform.position, 3f)
+            .Where(d => !skippedDoors.Contains(d.GetInstanceID()))
             .Where(d => {
                 Vector3 gap = d.transform.position - player.transform.position;
                 gap.y = 0f;
@@ -2876,12 +2887,18 @@ public class Companion : BaseUnityPlugin {
         if (!view || !view.IsValid()) return false;
         if (view.GetZDO().GetInt(ZDOVars.s_state) != 0) return false;   // already open; something else blocks
         doorUntil = Time.time + 1.5f;   // let it swing before judging the way again
-        if (!door.Interact(player, false, false)) {
-            Logger.LogInfo("A door bars the way and will not open for me - locked, or warded.");
-            return false;
-        }
-        Logger.LogInfo("Opened a door in the way.");
-        return true;
+        // Door.Interact returns TRUE when a guard stone refuses access - it reports that
+        // it handled the interaction, not that the door moved. So count attempts and
+        // give up out loud, rather than politely rattling the same handle forever.
+        int id = door.GetInstanceID();
+        doorTries = id == lastDoor ? doorTries + 1 : 1;
+        lastDoor = id;
+        door.Interact(player, false, false);
+        if (doorTries < 3) { Logger.LogInfo("Tried the door in the way (" + doorTries + ")."); return true; }
+        skippedDoors.Add(id);
+        Stumble("door will not open");
+        Say("This door will not open for me — locked, or someone's ward.");
+        return false;
     }
     // Logged when he gives up, so a stuck report becomes a lookup instead of a guess.
     string Probes(Vector3 origin, Vector3 desired, int mask) {
