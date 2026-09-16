@@ -69,7 +69,7 @@ public class Companion : BaseUnityPlugin {
     readonly Dictionary<string, Vector3> places = new Dictionary<string, Vector3>();
     bool busy;
     int generation;
-    float lastOrder, lastDeaf, lastBanter, stuckTime, lastExplain;
+    float lastOrder, lastDeaf, lastBanter, stuckTime, lastExplain, doorUntil;
     bool sprinting;   // Held across ticks so the run/walk decision has hysteresis.
     Player asked;            // Who he put a question to, and is listening to.
     string[] choices;        // Accepted answers; null means yes or no.
@@ -2180,6 +2180,8 @@ public class Companion : BaseUnityPlugin {
         if (delta.magnitude < arrival) return Step.Arrived;
         var direction = SelectWalkDirection(player.transform.position, delta.normalized);
         if (direction == Vector3.zero) {
+            // Try the handle before declaring the way shut.
+            if (TryDoor(player, delta)) return Step.Moving;
             ExplainBlocked(player.transform.position, delta.normalized,
                 LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain"));
             return Step.Blocked;
@@ -2420,6 +2422,34 @@ public class Companion : BaseUnityPlugin {
         return rise >= 0.25f && rise <= StepUp && slope <= 40f;
     }
 
+    // A closed door is a wall, and correctly reads as one - so steering rejects it and
+    // he stands there shoving it. He has known how to work a handle since 0.3.0; he
+    // was simply never asked to before giving up.
+    bool TryDoor(Player player, Vector3 heading) {
+        if (Time.time < doorUntil) return false;
+        heading.y = 0f;
+        if (heading.sqrMagnitude < 0.01f) return false;
+        heading.Normalize();
+        var door = Nearby<Door>(player.transform.position, 3f)
+            .Where(d => {
+                Vector3 gap = d.transform.position - player.transform.position;
+                gap.y = 0f;
+                // Only a door actually in his way, not one behind him.
+                return gap.sqrMagnitude > 0.01f && Vector3.Dot(gap.normalized, heading) > 0.3f;
+            })
+            .OrderBy(d => Vector3.Distance(d.transform.position, player.transform.position)).FirstOrDefault();
+        if (!door) return false;
+        var view = door.GetComponent<ZNetView>();
+        if (!view || !view.IsValid()) return false;
+        if (view.GetZDO().GetInt(ZDOVars.s_state) != 0) return false;   // already open; something else blocks
+        doorUntil = Time.time + 1.5f;   // let it swing before judging the way again
+        if (!door.Interact(player, false, false)) {
+            Logger.LogInfo("A door bars the way and will not open for me - locked, or warded.");
+            return false;
+        }
+        Logger.LogInfo("Opened a door in the way.");
+        return true;
+    }
     // Logged when he gives up, so a stuck report becomes a lookup instead of a guess.
     void ExplainBlocked(Vector3 origin, Vector3 desired, int mask) {
         if (Time.time - lastExplain < 5f) return;
@@ -2438,7 +2468,9 @@ public class Companion : BaseUnityPlugin {
             else why = "blocked at chest, rise " + rise.ToString("0.0");
             reasons.Add(angle.ToString("0") + "=" + why);
         }
-        Logger.LogInfo("Nowhere to step from " + Vector3ToConfig(origin) + ": " + string.Join("; ", reasons));
+        var shut = Nearby<Door>(origin, 3f).FirstOrDefault();
+        Logger.LogInfo("Nowhere to step from " + Vector3ToConfig(origin) + ": " + string.Join("; ", reasons) +
+                       (shut ? " (a door is within reach and did not open)" : ""));
     }
     // How far he can see along a heading before something stops him.
     static float Clearance(Vector3 origin, Vector3 direction, int mask, float range) {
