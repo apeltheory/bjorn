@@ -596,7 +596,10 @@ public class Companion : BaseUnityPlugin {
             me.GetInventory().GetAllItems().Count(i => i.m_equipped && i.GetArmor() > 0f) + " armour worn.");
 
         var foods = me.GetFoods().Count;
-        Say("Belly: " + foods + " of 3 slots" + (CarriesFood(me) ? ", food in the pack." : ", nothing to eat in the pack.") +
+        // Both facts, because they differ: he can be carrying a meal he is not yet
+        // allowed a second helping of.
+        Say("Belly: " + foods + " of 3 slots, " +
+            (!HasFood(me) ? "nothing to eat in the pack." : CanEatNow(me) ? "food in the pack." : "food in the pack, none of it ready yet.") +
             " Health " + Mathf.RoundToInt(me.GetHealth()) + ", stamina " + Mathf.RoundToInt(me.GetStamina()) + ".");
 
         bool bridge;
@@ -710,6 +713,10 @@ public class Companion : BaseUnityPlugin {
     bool EatNamed(string requested) {
         var item = FindItem(requested, foodOnly: true, equipOnly: false);
         if (item == null) return false;
+        if (!Player.m_localPlayer.CanEat(item, false)) {
+            Say("I've " + Localization.instance.Localize(item.m_shared.m_name) + " on me, but I can't stomach more of it yet.");
+            return true;
+        }
         Say(Player.m_localPlayer.EatFood(item) ? "I’ve eaten the " + Localization.instance.Localize(item.m_shared.m_name) + "." : "I cannot eat that yet.");
         return true;
     }
@@ -1052,7 +1059,9 @@ public class Companion : BaseUnityPlugin {
             .OrderByDescending(i => i.m_shared.m_food + i.m_shared.m_foodStamina)
             .FirstOrDefault();
         if (best == null) {
-            Say(player.GetFoods().Count >= 3 ? "I'm full as a jarl at Yule." : "I've nothing left to eat. Toss me something.");
+            Say(player.GetFoods().Count >= 3 ? "I'm full as a jarl at Yule."
+                : HasFood(player) ? "I've food on me, but I can't stomach more of it yet. Give it a while."
+                : "I've nothing left to eat. Toss me something.");
             return true;
         }
         string name = Localization.instance.Localize(best.m_shared.m_name);
@@ -1074,11 +1083,18 @@ public class Companion : BaseUnityPlugin {
     // Hungry, with nothing in the pack to fix it: food lying within a dozen paces is
     // worth the walk, and otherwise he says so rather than quietly starving. Tossing
     // him something is all it takes.
-    bool CarriesFood(Player player) {
+    // Two different questions, which were being answered by one method. Valheim
+    // refuses a second helping of the same food until it is half burnt down
+    // (Player.Food.CanEatAgain), so a man with a full pack of raspberries who just
+    // ate raspberries has plenty of food and nothing he can eat this minute.
+    static bool HasFood(Player player) {
+        return player.GetInventory().GetAllItems().Any(i => i.m_shared.m_food > 0f);
+    }
+    bool CanEatNow(Player player) {
         return player.GetInventory().GetAllItems().Any(i => i.m_shared.m_food > 0f && player.CanEat(i, false));
     }
     bool Peckish(Player player) {
-        if (player.GetFoods().Count >= 3 || CarriesFood(player)) { morsel = null; return false; }
+        if (player.GetFoods().Count >= 3 || HasFood(player)) { morsel = null; return false; }
         if (morsel && IsLive(morsel)) return true;
         morsel = null;
         if (Time.time < morselScan) return false;
@@ -1115,7 +1131,9 @@ public class Companion : BaseUnityPlugin {
         "Aye, that's the stuff.",
     };
     void Beg(Player player) {
-        if (player.GetFoods().Count > 0) { hungrySince = 0f; return; }
+        // Nothing to complain about if he is fed, or if he is carrying a meal and
+        // simply has to wait for the last one to burn down.
+        if (player.GetFoods().Count > 0 || HasFood(player)) { hungrySince = 0f; return; }
         if (hungrySince == 0f) hungrySince = Time.time;
         // Nags sooner the longer he has gone without.
         float wait = Time.time - hungrySince > 300f ? 60f : 120f;
@@ -1968,7 +1986,7 @@ public class Companion : BaseUnityPlugin {
     }
     // He is standing at the chest anyway: take a few meals if he has none on him.
     int Restock(Player player, Container chest) {
-        if (!chest || CarriesFood(player)) return 0;
+        if (!chest || HasFood(player)) return 0;
         var from = chest.GetInventory();
         int taken = 0;
         foreach (var item in from.GetAllItems().ToList()) {
