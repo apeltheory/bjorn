@@ -266,6 +266,13 @@ public class Companion : BaseUnityPlugin {
         var words = simple.Split(new[] { ' ', ',', '.', '!', '?', ';', ':', '\'' }, StringSplitOptions.RemoveEmptyEntries);
         // "don't follow me" and "no, stop chopping" must not be read as orders to do it.
         if (Mentions(words, "dont", "don't", "never", "nor", "instead")) return false;
+        // Nor may a question be. "What's the best wood to chop?" mentions chopping and
+        // wood and is not an instruction to go and do it. Opening with what, why, how
+        // and the rest marks a question; "can you chop wood" is a polite order and is
+        // deliberately left alone.
+        if (words.Length > 0 && Any(words[0], "what", "whats", "what's", "which", "why",
+                                    "when", "who", "whose", "where", "how", "is", "was", "does", "did"))
+            return false;
         if (Mentions(words, "repair", "mend", "fix", "repaired")) { Repair(); return true; }
         if (Mentions(words, "chop", "chopping", "fell", "felling", "cut") &&
             Mentions(words, "tree", "trees", "wood", "timber", "log", "logs")) { Chop(); return true; }

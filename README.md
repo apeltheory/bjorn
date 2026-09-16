@@ -285,6 +285,28 @@ patch of terrain that defeats him repeatedly shows up as a coordinate rather tha
 feeling. It also counts how many failures happened with `hands=EMPTY`, which is its own
 distinct bug.
 
+## Asking him things
+
+Anything that is not an order goes to the planner and comes back in his own voice, with
+the answer correct:
+
+| You say | He says |
+| --- | --- |
+| `Bjorn, what's the capital of the United States?` | Washington. A long row west, and I'd not fancy it. |
+| `Bjorn, what's 5+5?` | Ten. Count your fingers, that is what they are for. |
+
+He never refuses, never explains that he is a game companion, and never breaks character
+to say he cannot help. He is a Viking, not an oracle — he may be baffled you asked and
+will not know the modern word for a thing, but the fact has to be right.
+
+A question is told from an order by how it opens. `what`, `why`, `how`, `which`, `when`,
+`who`, `where` mark a question, so **"what's the best wood to chop?"** is answered rather
+than obeyed. `can you`, `could you`, `go and` are orders, so **"can you chop wood"** still
+sets him working.
+
+This is the one feature that genuinely needs the planner running, and it costs a call from
+the budget and a few seconds. Everything he can do himself stays instant and works offline.
+
 ## When he does not understand
 
 Every order that no direct command claims is sent to the planner, which reads the
