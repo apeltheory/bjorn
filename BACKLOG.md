@@ -112,13 +112,54 @@ shoreline. And `SetControls` calls `Jump()` internally *before* the reflected `m
 correction lands, while `Character.Jump` throws the forward impulse along `m_moveDir` — so
 every jump went wherever he last looked, not where he was walking.
 
-## Still open from the locomotion plan
+## Done from the locomotion plan
 
-Per-lane steering state. `previous` and `stuckTime` are shared by every job and every
-overlay, so a fight that interrupts a walk hands back a contaminated stuck clock. The plan
-proposes one `Steering` record per lane (job, pickup, flee, fight, retreat) and deleting
-every hand-written reset. Correct, and a large enough change that it wants doing on its own
-rather than at the end of a session.
+Per-lane steering state. Six callers shared one stuck clock, one avoid commitment and one
+sprint flag, so a fight interrupting a walk handed it back a clock it had not earned.
+Fourteen hand-written resets were papering over it; there is now a record per lane and four
+deliberate resets. Under review.
+
+## Asked for during the first play session
+
+| # | Asked for | Where it landed |
+| --- | --- | --- |
+| 27 | He ran at a wall instead of opening the door | Steering tries the handle before declaring the way shut. He had known how to work a door since 0.3.0; nothing in the movement code ever asked |
+| 28 | "repair your axe" and "go chop down some trees" took the slow path | Loose word matching after every exact form fails, so natural phrasings resolve locally and offline instead of costing a call and fifteen seconds |
+| 29 | Questions must not be obeyed | "What's the best wood to chop?" no longer sets him chopping. Opening word decides; "can you chop wood" is still an order |
+| 30 | In-game bug reporting | Anyone types `bug <what happened>`. Captures position, job, target, body, hands, pack, surroundings **and what all twelve steering probes saw** |
+| 31 | Automatic reporting over time | He records his own give-ups with the same geometry, deduplicated per spot per minute. `scripts/bugs.sh` ranks them by kind and by location |
+| 32 | Answer off-topic questions in character | "Washington. A long row west, and I'd not fancy it." Correct answer, his voice, never breaks character |
+| 33 | Tend the furnace, smelt ore | `tend the smelter` walks a circuit of every smelter, kiln, blast furnace and windmill within 40 m: output out, coal in, ore in, repeat until a full round shifts nothing |
+| 34 | Bake in the Valheim wiki | Rejected as such. Recipes come from `ObjectDB` — the installed game's own data, exact for this version and any mods — and broader questions go to Claude. A wiki would be machinery to replace knowledge already present |
+| 35 | Ambiguous recipe names | "How do I craft a spear" names the four spears and waits, using the follow-up window |
+
+## Fixed from the first play session
+
+Seven found in about forty minutes, against 29 from several hours of review — and of a
+different kind. Review finds engine mismatches; play finds capability that exists but was
+never wired into the behaviour that needed it.
+
+- He picked a fight with a training dummy, which never dies, so the threat never cleared
+- He claimed an empty pack while holding food — Valheim refuses a second helping of the
+  same food, and one method was answering both "has he food" and "can he eat now"
+- Repair demanded he already stand at a bench rather than walking to one
+- Repair compared gear against the nearest station only, so a stone axe near a forge failed
+- He stuck on small ledges: jumping was decided only after a direction was judged walkable,
+  so he could never jump the thing that made it unwalkable
+- He wedged behind a crafting station: 3.5 m of lookahead, 0.8 s of commitment, and scoring
+  that weighted heading 10:1 over clearance, which steers straight back into the corner
+- He ran at a closed door
+
+## Fixed from reviewing the fixes
+
+Four blockers, one of them introduced an hour earlier by the ledge fix:
+
+- **The ledge fix locked him out of every roofed building.** The ground probe started 3 m up
+  — above a house roof — so the ray landed on the roof and read as a two-metre wall
+- A halt in deep water was permanent: regen is zeroed off the ground, so a halted swimmer
+  floats there until someone walks to the machine
+- The mend errand walked to a bench that could not take the tool, then back, forever
+- Nothing ever put a tool back in his hands after the engine emptied them
 
 ## In flight
 
