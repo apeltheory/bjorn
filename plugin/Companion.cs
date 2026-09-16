@@ -139,8 +139,10 @@ public class Companion : BaseUnityPlugin {
     }
     void OnDestroy() { harmony?.UnpatchSelf(); Instance = null; }
     void Say(string text) {
-        if (Chat.instance && !string.IsNullOrWhiteSpace(text))
+        if (Chat.instance && !string.IsNullOrWhiteSpace(text)) {
             Chat.instance.SendText(Talker.Type.Normal, text.Substring(0, Math.Min(180, text.Length)));
+            Logger.LogInfo("Said: " + text);
+        }
     }
     void Halt(string reason = null) {
         job = Job.None; errand = Job.None; target = null; bed = null; sweepTarget = null; threat = null;
@@ -333,7 +335,7 @@ public class Companion : BaseUnityPlugin {
             if (Time.unscaledTime - lastDeaf > 5) { lastDeaf = Time.unscaledTime; Say(busy ? "One thing at a time — I'm still thinking." : "A moment."); }
             return;
         }
-        Logger.LogInfo("Accepted addressed order from a nearby player.");
+        Logger.LogInfo("Order: " + order);
         lastOrder = Time.unscaledTime;
         if (Any(simple, "follow", "follow me")) { Follow(speaker); return; }
         if (Any(simple, "come", "come here", "come to me", "over here")) { Come(speaker); return; }
@@ -908,11 +910,22 @@ public class Companion : BaseUnityPlugin {
         }
         return mended;
     }
+    // Standing on the bench already is the lucky case. Otherwise walk to one rather
+    // than refusing - being told "stand at a workbench" by someone who could simply
+    // go and stand at it is the kind of answer that makes him feel like a tool.
     void Repair() {
-        var station = StationAt(Player.m_localPlayer.transform.position, 2.5f);
-        if (!station) { Say("I must stand at a workbench or forge to mend anything."); return; }
-        int mended = Mend(station);
-        Say(mended == 0 ? "Nothing here needs mending." : "Mended " + mended + (mended == 1 ? " piece" : " pieces") + " of gear.");
+        var me = Player.m_localPlayer;
+        var station = StationAt(me.transform.position, 3f);
+        if (station) {
+            int mended = Mend(station);
+            Say(mended == 0 ? "Nothing here needs mending." : "Mended " + mended + (mended == 1 ? " piece" : " pieces") + " of gear.");
+            return;
+        }
+        var walk = StationAt(me.transform.position, 40f);
+        if (!walk) { Say("I can see no workbench or forge to mend at. Bring me to one."); return; }
+        Begin(Job.Mend);
+        destination = walk.transform.position;
+        Say("The " + Localization.instance.Localize(walk.m_name) + "'s not far. I'll walk over and mend.");
     }
     // Mirrors Valheim's own repair test: the station must be the one the recipe
     // names, at a high enough level.
@@ -949,7 +962,13 @@ public class Companion : BaseUnityPlugin {
         // HaveRequirements checks m_currentStation, which is null for a bot, so set it
         // for the duration of the craft. UpdateStations clears it again next frame.
         var standing = needed ? StationAt(me.transform.position, 2.5f) : null;
-        if (needed && !standing) { Say("I must stand at a " + Localization.instance.Localize(needed.m_name) + " to make " + name + "."); return true; }
+        if (needed && !standing) {
+            var seen = StationAt(me.transform.position, 40f);
+            Say(seen
+                ? "I need a " + Localization.instance.Localize(needed.m_name) + " for that, and I'm " + Mathf.RoundToInt(Vector3.Distance(seen.transform.position, me.transform.position)) + " paces off. Walk me in."
+                : "I must stand at a " + Localization.instance.Localize(needed.m_name) + " to make " + name + ".");
+            return true;
+        }
         if (standing) me.SetCraftingStation(standing);
         long crafter = Game.instance.GetPlayerProfile().GetPlayerID();
         int made = 0;
@@ -1621,23 +1640,26 @@ public class Companion : BaseUnityPlugin {
         return true;
     }
     void Mend(Player player) {
-        var standing = StationAt(player.transform.position, 2.5f);
+        var standing = StationAt(player.transform.position, 3f);
         if (standing) {
             int mended = Mend(standing);
-            Say(mended == 0 ? "Nothing of mine needed mending after all." : "Mended " + mended + ". Back to it.");
-            ResumeSweep(player);
+            string said = mended == 0 ? "Nothing of mine needed mending after all." : "Mended " + mended + " of my own.";
+            // A mend that interrupted a job goes back to it; a plain "repair" is done.
+            if (errand != Job.None) { Say(said + " Back to it."); ResumeSweep(player); }
+            else Halt(said);
             return;
         }
         var station = StationAt(player.transform.position, 15f);
-        if (station && Vector3.Distance(station.transform.position, player.transform.position) > 1.8f) {
-            destination = station.transform.position; reachedAt = 0f;
-            return;
+        if (station) {
+            Vector3 spot = station.transform.position;
+            // Only restart the patience clock when genuinely heading somewhere new.
+            // Retargeting the same bench every tick reset it forever, so a bench he
+            // could not quite reach - a raised one, say - never timed out.
+            if (Vector3.Distance(spot, destination) > 0.5f) { destination = spot; reachedAt = 0f; return; }
         }
-        // Valheim registers the station from its own update, so allow a moment before
-        // giving up rather than standing there forever.
         if (reachedAt == 0f) reachedAt = Time.time;
         if (Time.time - reachedAt > 8f)
-            Halt(station ? "I stand at the station but it will not serve me." : "I came to mend, but there is no station here.");
+            Halt(station ? "I'm at the bench but can't get close enough to work." : "I came to mend, but there's no station here.");
     }
     void ResumeSweep(Player player) {
         job = Job.Resume; reachedAt = 0f; stuckTime = 0; previous = player.transform.position;
