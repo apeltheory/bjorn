@@ -873,6 +873,26 @@ public class Companion : BaseUnityPlugin {
         foreach (char letter in text) if (char.IsLetterOrDigit(letter)) builder.Append(char.ToLowerInvariant(letter));
         return builder.ToString();
     }
+    // Word-wise matching, for names people describe rather than quote. "Blue standing
+    // torches" and "Standing blue-burning iron torch" share no contiguous substring, so
+    // the squashed-key test could never join them. Every requested word must appear in
+    // the candidate, and a word matches if either is a prefix of the other - which
+    // handles plurals without a rule for them.
+    static readonly char[] wordBreaks = { ' ', '-', '_', ',', '.', '\'', '(', ')', '/' };
+    static bool WordMatches(string candidate, string wanted) {
+        if (string.IsNullOrWhiteSpace(candidate) || string.IsNullOrWhiteSpace(wanted)) return false;
+        var have = candidate.ToLowerInvariant().Split(wordBreaks, StringSplitOptions.RemoveEmptyEntries);
+        var want = wanted.ToLowerInvariant().Split(wordBreaks, StringSplitOptions.RemoveEmptyEntries);
+        if (want.Length == 0) return false;
+        foreach (var one in want) {
+            bool found = false;
+            foreach (var other in have)
+                if (one.Length >= 3 && other.Length >= 3 && (one.StartsWith(other, StringComparison.Ordinal) ||
+                                                            other.StartsWith(one, StringComparison.Ordinal))) { found = true; break; }
+            if (!found) return false;
+        }
+        return true;
+    }
     static bool KeyMatches(string candidate, string key) {
         if (key.Length == 0) return false;
         string name = Key(candidate);
@@ -883,9 +903,10 @@ public class Companion : BaseUnityPlugin {
     }
     static bool OneNameMatches(ItemDrop.ItemData item, string wanted) {
         string key = Key(wanted);
-        return KeyMatches(Localization.instance.Localize(item.m_shared.m_name), key) ||
-               KeyMatches(item.m_shared.m_name, key) ||
-               (item.m_dropPrefab && KeyMatches(item.m_dropPrefab.name, key));
+        string shown = Localization.instance.Localize(item.m_shared.m_name);
+        return KeyMatches(shown, key) || KeyMatches(item.m_shared.m_name, key) ||
+               (item.m_dropPrefab && KeyMatches(item.m_dropPrefab.name, key)) ||
+               WordMatches(shown, wanted);   // "fine wood arrows", "the bronze axe"
     }
     // People ask for more than one thing at a time - "the axe and club", "wood, stone".
     // A single filter string matched neither, so the planner left the item empty, and an
@@ -1332,10 +1353,14 @@ public class Companion : BaseUnityPlugin {
         // need his name in front of it.
         // Items and pieces are offered together: whoever asks does not care which kind
         // of thing it is. "A spear" is an item, "the blue standing torch" is a piece.
-        var loose = known.Where(r => KeyMatches(RecipeName(r), key))
+        string asked = Bare(wanted);
+        var loose = known.Where(r => KeyMatches(RecipeName(r), key) || WordMatches(RecipeName(r), asked))
             .GroupBy(RecipeName).Select(g => g.First()).ToList();
-        var built = pieces.Where(x => KeyMatches(PieceName(x), key))
+        var built = pieces.Where(x => KeyMatches(PieceName(x), key) || WordMatches(PieceName(x), asked))
             .GroupBy(PieceName).Select(g => g.First()).ToList();
+        if (loose.Count + built.Count == 0)
+            Logger.LogInfo("No recipe or piece matched '" + wanted + "' among " +
+                           known.Count + " recipes and " + pieces.Count + " pieces.");
         if (loose.Count + built.Count == 0) return false;
         if (loose.Count + built.Count == 1) {
             if (loose.Count == 1) TellRecipe(loose[0]); else TellPiece(built[0]);
