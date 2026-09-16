@@ -23,6 +23,15 @@ cd /home/apel-xps/Work/valheim-companion
 ./scripts/bjorn.sh game start|stop|restart
 ```
 
+## Joining a server
+
+With `VALHEIM_SERVER` set in `.env` (as `ip:port`), `game start` selects the character and
+joins by itself, using Valheim's own `-joinserverwithcharacter` argument. Without it, the
+game stops at the main menu and someone has to join by hand — say so rather than waiting.
+
+Confirm he actually arrived before reporting success: `./scripts/bjorn.sh logs` should show
+world loading, and `Bjorn, self test` in chat is the definitive check.
+
 ## Rules that matter
 
 **Always `status` first.** It is cheap and tells you whether you are about to

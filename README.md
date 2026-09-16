@@ -23,7 +23,22 @@ Bjorn runs a real Valheim client on this laptop using his own Steam account. You
 
    **Use this launcher. Launching normally through Steam does not load this separate mod profile.** The launcher starts a 960×540 window; lower graphics quality further in Valheim's settings if needed.
 
-4. Select/create the **Bjorn** character and join your server manually. The launcher uses the currently signed-in Steam account; it does not log in or join automatically.
+4. **He can join by himself.** Put your server in `.env` and the launcher takes it from there:
+
+   ```sh
+   VALHEIM_SERVER=192.168.1.50:2456     # a dedicated server, as ip:port
+   VALHEIM_CHARACTER=Bjorn
+   VALHEIM_PASSWORD=yourpassword
+   ```
+
+   That uses Valheim's own `-joinserverwithcharacter` argument, which selects the
+   character and joins in one step — no mod involved, and nothing to click. Leave
+   `VALHEIM_SERVER` blank and it starts at the menu as before, to be joined by hand.
+
+   This works for a **dedicated server**, addressed by ip:port. A world hosted from
+   someone's game client is reached through Steam rather than an address, so that still
+   needs joining by hand. The launcher uses whichever Steam account is signed in; it does
+   not log Steam in for you.
 5. Press **F8** while the game is focused to switch to bot control. The on-screen message confirms the mode. The last configured mode was **manual** (`Enabled = false`).
 6. From your PC, stand nearby and type `Bjorn, inventory` in normal chat. Then try `Bjorn, follow me` and `Bjorn, stay`.
 
