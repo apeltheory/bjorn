@@ -67,7 +67,7 @@ public class Companion : BaseUnityPlugin {
     readonly Dictionary<string, Vector3> places = new Dictionary<string, Vector3>();
     bool busy;
     int generation;
-    float lastOrder, lastDeaf, lastBanter, stuckTime;
+    float lastOrder, lastDeaf, lastBanter, stuckTime, lastExplain;
     bool sprinting;   // Held across ticks so the run/walk decision has hysteresis.
     Player asked;            // Who he put a question to, and is listening to.
     string[] choices;        // Accepted answers; null means yes or no.
@@ -897,45 +897,84 @@ public class Companion : BaseUnityPlugin {
     }
     // Durability is written directly, so repairing needs no engine gate - only the
     // right station to be standing there.
-    int Mend(CraftingStation station) {
-        var me = Player.m_localPlayer;
-        var worn = new List<ItemDrop.ItemData>();
-        me.GetInventory().GetWornItems(worn);
-        int mended = 0;
-        foreach (var item in worn) {
-            if (!CanRepair(item, station)) continue;
-            me.RaiseSkill(Skills.SkillType.Crafting, 1f - item.m_durability / item.GetMaxDurability());
-            item.m_durability = item.GetMaxDurability();
-            mended++;
-        }
-        return mended;
-    }
+
     // Standing on the bench already is the lucky case. Otherwise walk to one rather
     // than refusing - being told "stand at a workbench" by someone who could simply
     // go and stand at it is the kind of answer that makes him feel like a tool.
     void Repair() {
         var me = Player.m_localPlayer;
-        var station = StationAt(me.transform.position, 3f);
-        if (station) {
-            int mended = Mend(station);
-            Say(mended == 0 ? "Nothing here needs mending." : "Mended " + mended + (mended == 1 ? " piece" : " pieces") + " of gear.");
+        string trouble;
+        int mended = Mend(StationsAround(me.transform.position, 5f), out trouble);
+        if (mended > 0) { Say("Mended " + mended + (mended == 1 ? " piece" : " pieces") + " of gear."); return; }
+        var worn = WornGear();
+        if (worn.Count == 0) { Say("Nothing of mine needs mending."); return; }
+        // Something IS worn but nothing here will take it. Find a station that would
+        // and walk to it, rather than reporting that the gear is fine.
+        var stations = StationsAround(me.transform.position, 40f);
+        var target = stations.FirstOrDefault(s => worn.Any(i => CanRepair(i, s)));
+        if (target) {
+            Begin(Job.Mend);
+            destination = target.transform.position;
+            Say("The " + Localization.instance.Localize(target.m_name) + "'s the one for it. Walking over.");
             return;
         }
-        var walk = StationAt(me.transform.position, 40f);
-        if (!walk) { Say("I can see no workbench or forge to mend at. Bring me to one."); return; }
-        Begin(Job.Mend);
-        destination = walk.transform.position;
-        Say("The " + Localization.instance.Localize(walk.m_name) + "'s not far. I'll walk over and mend.");
+        Say(trouble != null ? "I can't mend here — " + trouble + "." : "I can see no station that would mend my gear.");
     }
     // Mirrors Valheim's own repair test: the station must be the one the recipe
     // names, at a high enough level.
     static bool CanRepair(ItemDrop.ItemData item, CraftingStation station) {
         if (!item.m_shared.m_canBeReparied || item.m_durability >= item.GetMaxDurability()) return false;
         var recipe = ObjectDB.instance ? ObjectDB.instance.GetRecipe(item) : null;
-        if (recipe == null) return false;
+        if (recipe == null || (!recipe.m_craftingStation && !recipe.m_repairStation)) return false;
         bool named = (recipe.m_repairStation && recipe.m_repairStation.m_name == station.m_name) ||
-                     (recipe.m_craftingStation && recipe.m_craftingStation.m_name == station.m_name);
+                     (recipe.m_craftingStation && recipe.m_craftingStation.m_name == station.m_name) ||
+                     item.m_worldLevel < Game.m_worldLevel;   // vanilla allows this too
         return named && Mathf.Min(station.GetLevel(), 4) >= recipe.m_minStationLevel;
+    }
+    // Every usable station within reach, nearest first. Repairing against only the
+    // closest is wrong the moment a camp has more than one: a stone axe wants the
+    // workbench even when the forge happens to be a pace nearer.
+    List<CraftingStation> StationsAround(Vector3 where, float radius) {
+        var me = Player.m_localPlayer;
+        return Nearby<CraftingStation>(where, radius).Where(s => s && s.CheckUsable(me, false))
+            .OrderBy(s => Vector3.Distance(s.transform.position, where)).ToList();
+    }
+    static List<ItemDrop.ItemData> WornGear() {
+        var worn = new List<ItemDrop.ItemData>();
+        Player.m_localPlayer.GetInventory().GetWornItems(worn);
+        return worn;
+    }
+    // Says which station a piece actually wants, rather than "nothing needs mending".
+    static string WhyNotMended(ItemDrop.ItemData item, List<CraftingStation> stations) {
+        string name = Localization.instance.Localize(item.m_shared.m_name);
+        if (!item.m_shared.m_canBeReparied) return "the " + name + " cannot be mended at all";
+        var recipe = ObjectDB.instance ? ObjectDB.instance.GetRecipe(item) : null;
+        if (recipe == null) return "I know no recipe for the " + name;
+        var needs = recipe.m_repairStation ? recipe.m_repairStation : recipe.m_craftingStation;
+        if (!needs) return "nothing mends the " + name;
+        string wants = Localization.instance.Localize(needs.m_name);
+        return stations.Any(s => s.m_name == needs.m_name)
+            ? "the " + wants + " here is too low a level for the " + name
+            : "the " + name + " needs a " + wants;
+    }
+    int Mend(List<CraftingStation> stations, out string trouble) {
+        trouble = null;
+        var me = Player.m_localPlayer;
+        int mended = 0;
+        foreach (var item in WornGear()) {
+            var station = stations.FirstOrDefault(s => CanRepair(item, s));
+            if (station == null) {
+                if (trouble == null) trouble = WhyNotMended(item, stations);
+                Logger.LogInfo("Not mending " + Localization.instance.Localize(item.m_shared.m_name) +
+                               " (" + item.m_durability.ToString("0") + "/" + item.GetMaxDurability().ToString("0") + "): " +
+                               WhyNotMended(item, stations));
+                continue;
+            }
+            me.RaiseSkill(Skills.SkillType.Crafting, 1f - item.m_durability / item.GetMaxDurability());
+            item.m_durability = item.GetMaxDurability();
+            mended++;
+        }
+        return mended;
     }
     // "craft 20 wood arrows" — splits an optional leading count off the item name.
     static int SplitCount(ref string wanted, int cap = 20, int none = 1) {
@@ -1640,10 +1679,13 @@ public class Companion : BaseUnityPlugin {
         return true;
     }
     void Mend(Player player) {
-        var standing = StationAt(player.transform.position, 3f);
-        if (standing) {
-            int mended = Mend(standing);
-            string said = mended == 0 ? "Nothing of mine needed mending after all." : "Mended " + mended + " of my own.";
+        var standing = StationsAround(player.transform.position, 5f);
+        if (standing.Count > 0) {
+            string trouble;
+            int mended = Mend(standing, out trouble);
+            string said = mended == 0
+                ? (trouble != null ? "I can't mend here — " + trouble + "." : "Nothing of mine needed mending after all.")
+                : "Mended " + mended + " of my own.";
             // A mend that interrupted a job goes back to it; a plain "repair" is done.
             if (errand != Job.None) { Say(said + " Back to it."); ResumeSweep(player); }
             else Halt(said);
@@ -2088,7 +2130,11 @@ public class Companion : BaseUnityPlugin {
         delta.y = 0;
         if (delta.magnitude < arrival) return Step.Arrived;
         var direction = SelectWalkDirection(player.transform.position, delta.normalized);
-        if (direction == Vector3.zero) return Step.Blocked;
+        if (direction == Vector3.zero) {
+            ExplainBlocked(player.transform.position, delta.normalized,
+                LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain"));
+            return Step.Blocked;
+        }
         direction.y = 0;
         direction.Normalize();
         int mask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain");
@@ -2290,35 +2336,86 @@ public class Companion : BaseUnityPlugin {
         }
     }
 
+    const float StepUp = 1.4f;    // The tallest lip he can hop onto.
+    const float StepDown = 2.5f;  // The deepest drop worth taking on purpose.
+
+    // How the ground just ahead compares with where he stands. Measuring the height
+    // directly beats inferring it from a chest-height ray: a ledge lower than his
+    // chest is invisible to that ray, and a ledge higher than it looks like a wall.
+    static bool GroundAhead(Vector3 origin, Vector3 direction, float distance, int mask, out float rise, out float slope) {
+        rise = 0f;
+        slope = 90f;
+        Vector3 probe = origin + direction * distance + Vector3.up * 3f;
+        if (!Physics.Raycast(probe, Vector3.down, out RaycastHit hit, 7f, mask)) return false;
+        rise = hit.point.y - origin.y;
+        slope = Vector3.Angle(hit.normal, Vector3.up);
+        return true;
+    }
     bool CanJumpForward(Vector3 origin, Vector3 direction, int mask) {
         direction.y = 0;
         direction.Normalize();
-        // A chest-height hit with walkable ground beyond it is usually a step,
-        // stair lip, or small rock. Large walls are left to side-steering.
-        if (!Physics.Raycast(origin + Vector3.up * 0.65f, direction, out RaycastHit lip, 0.9f, mask) || lip.normal.y > 0.55f) return false;
-        Vector3 landing = origin + direction * 1.3f + Vector3.up * 1.2f;
-        return Physics.Raycast(landing, Vector3.down, out RaycastHit hit, 2.8f, mask) && hit.distance < 2.1f;
+        if (!GroundAhead(origin, direction, 1.1f, mask, out float rise, out float slope)) return false;
+        // Worth a jump only for a lip he can land on top of - not a slope he can walk
+        // and not a wall he cannot clear.
+        return rise >= 0.25f && rise <= StepUp && slope <= 40f;
     }
+
+    // Logged when he gives up, so a stuck report becomes a lookup instead of a guess.
+    void ExplainBlocked(Vector3 origin, Vector3 desired, int mask) {
+        if (Time.time - lastExplain < 5f) return;
+        lastExplain = Time.time;
+        var reasons = new List<string>();
+        foreach (float angle in new[] { 0f, -35f, 35f, -70f, 70f, -110f, 110f, 180f }) {
+            Vector3 candidate = Quaternion.AngleAxis(angle, Vector3.up) * desired;
+            candidate.y = 0;
+            if (candidate.sqrMagnitude < 0.01f) continue;
+            candidate.Normalize();
+            string why;
+            if (!GroundAhead(origin, candidate, 1.35f, mask, out float rise, out float slope)) why = "void";
+            else if (rise > StepUp) why = "wall " + rise.ToString("0.0");
+            else if (rise < -StepDown) why = "drop " + rise.ToString("0.0");
+            else if (slope > 35f) why = "slope " + slope.ToString("0");
+            else why = "blocked at chest, rise " + rise.ToString("0.0");
+            reasons.Add(angle.ToString("0") + "=" + why);
+        }
+        Logger.LogInfo("Nowhere to step from " + Vector3ToConfig(origin) + ": " + string.Join("; ", reasons));
+    }
+    // How far he can see along a heading before something stops him.
+    static float Clearance(Vector3 origin, Vector3 direction, int mask, float range) {
+        return Physics.Raycast(origin + Vector3.up * 0.6f, direction, out RaycastHit hit, range, mask)
+            ? hit.distance : range;
+    }
+    static readonly float[] turns = { 0f, -30f, 30f, -60f, 60f, -90f, 90f, -120f, 120f, -150f, 150f, 180f };
 
     Vector3 SelectWalkDirection(Vector3 origin, Vector3 desired) {
         int mask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain");
+        // Committed to rounding something: hold that line. A building takes several
+        // metres to clear, and re-deciding every tick is what walks him back into it.
         if (Time.time < avoidUntil && IsWalkable(origin, avoidDirection, mask)) return avoidDirection;
 
-        // Keep the desired heading when clear. Otherwise sample progressively wider
-        // turns. Holding the selected side briefly prevents left/right oscillation.
-        float[] angles = { 0f, -35f, 35f, -70f, 70f, -110f, 110f, 180f };
+        bool barred = !IsWalkable(origin, desired, mask);
         Vector3 best = Vector3.zero;
         float bestScore = float.NegativeInfinity;
-        foreach (float angle in angles) {
+        foreach (float angle in turns) {
             Vector3 candidate = Quaternion.AngleAxis(angle, Vector3.up) * desired;
+            candidate.y = 0f;
+            if (candidate.sqrMagnitude < 0.01f) continue;
+            candidate.Normalize();
             if (!IsWalkable(origin, candidate, mask)) continue;
-            float score = Vector3.Dot(candidate, desired) * 10f;
-            // Slightly prefer the side with more open space when both are viable.
-            if (Physics.Raycast(origin + Vector3.up * 0.6f, candidate, out RaycastHit hit, 3.5f, mask)) score += hit.distance;
-            else score += 3.5f;
+            float toward = Vector3.Dot(candidate, desired);
+            // Look well past the next step, or he commits to a line that dead-ends a
+            // metre later - which is how a workbench and its extensions trap him.
+            float clear = Clearance(origin, candidate, mask, 6f);
+            // With the straight line barred, open ground matters more than heading.
+            // Hugging the goal direction is precisely what wedges him into a corner.
+            float score = barred ? clear * 3f + toward * 2f : toward * 10f + clear;
             if (score > bestScore) { bestScore = score; best = candidate; }
         }
-        if (best != desired && best != Vector3.zero) { avoidDirection = best; avoidUntil = Time.time + 0.8f; }
+        if (best != Vector3.zero && Vector3.Dot(best, desired) < 0.95f) {
+            avoidDirection = best;
+            // Long enough to walk the length of a building, not just past a trunk.
+            avoidUntil = Time.time + (barred ? 3f : 1f);
+        }
         return best;
     }
 
@@ -2326,25 +2423,24 @@ public class Companion : BaseUnityPlugin {
         direction.y = 0;
         if (direction.sqrMagnitude < 0.01f) return false;
         direction.Normalize();
-        // Two rays let the bot squeeze around small corners while rejecting walls
-        // and drops before committing to a turn.
-        Vector3 chest = origin + Vector3.up * 0.65f;
-        if (Physics.Raycast(chest, direction, out RaycastHit obstacle, 1.35f, mask)) {
-            // Terrain rising in front of the player is a slope, not a wall.
-            if (obstacle.normal.y < 0.55f) return false;
-        }
-        // Probe from above the destination so uphill terrain is still found.
-        Vector3 foot = origin + direction * 1.35f + Vector3.up * 2.2f;
-        if (!Physics.Raycast(foot, Vector3.down, out RaycastHit ground, 4.5f, mask)) {
+        if (!GroundAhead(origin, direction, 1.35f, mask, out float rise, out float slope)) {
             // No floor: open water reads exactly like a void, because the mask holds
             // no water layer. Once he is actually swimming that is fine to cross, and
             // Drive breaks off if the stamina keeping him up runs low.
             return Player.m_localPlayer && Player.m_localPlayer.IsSwimming();
         }
+        if (rise > StepUp || rise < -StepDown) return false;   // a wall, or a fall
         // Valheim slides a player on anything past 38 degrees (Character.GetSlideAngle),
-        // at 5 m/s and with no steering authority, so treating 48 as walkable was
-        // authorising ten degrees of guaranteed loss of control. Stay under it.
-        return Vector3.Angle(ground.normal, Vector3.up) <= 35f;
+        // at 5 m/s and with no steering authority, so stay under it.
+        if (slope > 35f) return false;
+        // A face at chest height only blocks when it is not a lip he can hop. This is
+        // the case that stranded him: jumping used to be decided only AFTER a
+        // direction was judged walkable, so he could never jump the very thing that
+        // made it unwalkable.
+        Vector3 chest = origin + Vector3.up * 0.65f;
+        if (Physics.Raycast(chest, direction, out RaycastHit obstacle, 1.35f, mask) && obstacle.normal.y < 0.55f)
+            return rise >= 0.25f;
+        return true;
     }
     [HarmonyPatch(typeof(PlayerController), "FixedUpdate")]
     class Controls {
