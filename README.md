@@ -241,6 +241,29 @@ still misses goes to Claude, which usually recovers the intent.
 Turn it on with `Listen = true` in the mod config. It is off by default and polls nothing
 while off.
 
+## Reporting a bug from in game
+
+Anyone on the server can type `bug <what happened>` in normal chat:
+
+```
+bug he ran at the wall instead of opening the door
+```
+
+It is not an order — no name prefix, no cooldown, and it works in manual mode or when he
+is not spawned. He confirms in chat and appends a snapshot to `runtime/reports.log`: where
+he was, the job and any detour, his target and threat, health and stamina and food, what is
+in his hands and his pack, what is around him, and **what all twelve steering probes saw at
+that instant**.
+
+That last part is the point. "He got stuck on something" is a paraphrase; the probe line is
+the geometry:
+
+```
+steering: 0=wall 1.8; -30=slope 47; 30=blocked at chest, rise 0.9 (a door is within reach and did not open)
+```
+
+Read them with `./scripts/bugs.sh`, `./scripts/bugs.sh 5`, or `./scripts/bugs.sh all`.
+
 ## When he does not understand
 
 Every order that no direct command claims is sent to the planner, which reads the
@@ -333,6 +356,7 @@ Other than the in-game F8 toggle, edit configuration while the game is closed.
 | `scripts/check-api.py` | Make a small direct Anthropic connection test |
 | `scripts/check-commands.py` | Static checks on the chat dispatch: unreachable commands, duplicates, truncated chat lines |
 | `scripts/say-to-bjorn.py` | Push a line to Bjorn as if spoken; the seam any speech-to-text plugs into |
+| `scripts/bugs.sh` | Read the reports filed in game with `bug ...` |
 | `runtime/game/BepInEx/plugins/` | Installed Bjorn and Better Networking plugins |
 | `runtime/game/BepInEx/LogOutput.log` | Mod/game log |
 | `runtime/unity.log` | Unity log from launches that explicitly selected this file |

@@ -61,6 +61,23 @@ In game, `Bjorn, self test` is the fastest confirmation the new build is live: o
 order, six lines back covering version, known places, surroundings, tool wear,
 belly and whether the planner is reachable. It touches nothing.
 
+## Bug reports filed in game
+
+Anyone on the server can type `bug <what happened>` in normal chat - it is not an order,
+needs no name prefix, and works in manual mode. Each one appends a snapshot to
+`runtime/reports.log`: position and biome, current job and detour, target and threat,
+health, stamina, food, what is in his hands and his pack, what is around him, and what
+all twelve steering probes saw at that instant.
+
+```sh
+./scripts/bugs.sh          # the most recent report
+./scripts/bugs.sh 5        # the last five
+./scripts/bugs.sh all
+```
+
+Read the report before theorising. The `steering:` line is usually the answer when the
+complaint is about getting stuck, and `hands: EMPTY` explains most "he did nothing".
+
 ## Where things are
 
 | Path | What |
@@ -69,5 +86,6 @@ belly and whether the planner is reachable. It touches nothing.
 | `runtime/logs/game.log` | Launcher stdout |
 | `runtime/game/BepInEx/LogOutput.log` | The plugin's own log — where `Logger.LogInfo` goes |
 | `runtime/unity.log` | Unity log |
+| `runtime/reports.log` | Bug reports filed in game with `bug ...` |
 
 Do not read or print `.env` or `runtime/bridge.token`.

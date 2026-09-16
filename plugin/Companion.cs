@@ -281,6 +281,65 @@ public class Companion : BaseUnityPlugin {
         if (string.IsNullOrWhiteSpace(text)) return null;
         return text.Trim().Trim('.', '!', '?').ToLowerInvariant();
     }
+    // Anyone on the server can file one, addressed to nobody: "bug he got stuck at the
+    // doorway". The note is the least useful part - what matters is the state captured
+    // with it, especially what the steering probes saw at that moment.
+    bool Reported(string text, Player speaker) {
+        if (!text.StartsWith("bug", StringComparison.OrdinalIgnoreCase)) return false;
+        // "bugs" and "bugger" are not bug reports.
+        if (text.Length > 3 && " ,:.!-".IndexOf(text[3]) < 0) return false;
+        string note = text.Length > 3 ? text.Substring(3).Trim(' ', ',', ':', '.', '!', '-') : "";
+        var me = Player.m_localPlayer;
+        var report = new StringBuilder();
+        report.AppendLine("== " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " ==");
+        report.AppendLine("from   : " + (speaker ? speaker.GetPlayerName() : "someone out of sight"));
+        report.AppendLine("note   : " + (note.Length > 0 ? note : "(none given)"));
+        if (!me) {
+            report.AppendLine("state  : no local player - he was not spawned");
+        } else {
+            Vector3 at = me.transform.position;
+            report.AppendLine("at     : " + Vector3ToConfig(at) + " in the " + Spaced(Heightmap.FindBiome(at).ToString()));
+            report.AppendLine("job    : " + job + (errand != Job.None ? " (detour from " + errand + ")" : "") + " - " + JobWord());
+            report.AppendLine("target : player=" + (target ? target.GetPlayerName() : "none") +
+                              " sweep=" + (sweepTarget ? sweepTarget.name : "none") +
+                              " threat=" + (threat ? Localization.instance.Localize(threat.m_name) : "none") +
+                              " filter=" + (sweepFilter ?? "none"));
+            report.AppendLine("body   : health " + Mathf.RoundToInt(me.GetHealth()) + "/" + Mathf.RoundToInt(me.GetMaxHealth()) +
+                              ", stamina " + Mathf.RoundToInt(me.GetStamina()) + "/" + Mathf.RoundToInt(me.GetMaxStamina()) +
+                              ", foods " + me.GetFoods().Count + "/3, swimming=" + me.IsSwimming());
+            var held = me.GetCurrentWeapon();
+            report.AppendLine("hands  : " + (held != null
+                ? Localization.instance.Localize(held.m_shared.m_name) + " " + held.m_durability.ToString("0") + "/" + held.GetMaxDurability().ToString("0")
+                : "EMPTY"));
+            report.AppendLine("pack   : " + string.Join(", ", me.GetInventory().GetAllItems()
+                .GroupBy(i => Localization.instance.Localize(i.m_shared.m_name))
+                .Select(g => g.Key + " x" + g.Sum(i => i.m_stack)).Take(20)));
+            report.AppendLine("around : " + Nearby<Container>(at, 8f).Count(IsChest) + " chests, " +
+                              StationsAround(at, 8f).Count + " stations, " +
+                              Nearby<Door>(at, 4f).Count() + " doors, " +
+                              Nearby<ItemDrop>(at, 12f).Count(d => !d.IsPiece()) + " drops");
+            report.AppendLine("places : " + (places.Count == 0 ? "none" : string.Join(", ", places.Keys)) +
+                              (campKnown ? "; camp " + Mathf.RoundToInt(campSpan) + "m at " + Vector3ToConfig(camp) : "; no camp"));
+            // The geometry at the moment of the complaint. This is the part that turns
+            // "he got stuck on something" into an answer.
+            Vector3 facing = target ? target.transform.position - at : me.transform.forward;
+            facing.y = 0f;
+            if (facing.sqrMagnitude < 0.01f) facing = Vector3.forward;
+            report.AppendLine("steering: " + Probes(at, facing.normalized,
+                LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain")));
+        }
+        string path = null;
+        try {
+            string folder = Path.GetDirectoryName(tokenFile.Value);
+            path = Path.Combine(folder, "reports.log");
+            File.AppendAllText(path, report.ToString() + "\n");
+        } catch (Exception problem) {
+            Logger.LogWarning("Could not write the report: " + problem.Message);
+        }
+        Logger.LogInfo("BUG REPORT\n" + report);
+        Say(path != null ? "Noted. I've written down where I was and what I could see." : "Noted, though I could not write it down.");
+        return true;
+    }
     internal void Receive(GameObject source, long senderId, string text) {
         var me = Player.m_localPlayer;
         if (text == null) return;
@@ -288,7 +347,12 @@ public class Companion : BaseUnityPlugin {
         bool addressed = text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && text.Length > prefix.Length &&
                          " ,:".IndexOf(text[prefix.Length]) >= 0;
         bool listening = asked && Time.unscaledTime < askedUntil;
-        if (!addressed && !listening) return;
+        if (!addressed && !listening) {
+            // A bug report is not an order. It works in manual mode, from any player,
+            // and whether or not he can see who spoke.
+            if (Reported(text, source ? source.GetComponent<Player>() : null)) return;
+            return;
+        }
         if (!Active) {
             Logger.LogInfo("Addressed order ignored: bot is in manual mode or not spawned.");
             return;
@@ -2451,9 +2515,7 @@ public class Companion : BaseUnityPlugin {
         return true;
     }
     // Logged when he gives up, so a stuck report becomes a lookup instead of a guess.
-    void ExplainBlocked(Vector3 origin, Vector3 desired, int mask) {
-        if (Time.time - lastExplain < 5f) return;
-        lastExplain = Time.time;
+    string Probes(Vector3 origin, Vector3 desired, int mask) {
         var reasons = new List<string>();
         foreach (float angle in new[] { 0f, -35f, 35f, -70f, 70f, -110f, 110f, 180f }) {
             Vector3 candidate = Quaternion.AngleAxis(angle, Vector3.up) * desired;
@@ -2469,8 +2531,12 @@ public class Companion : BaseUnityPlugin {
             reasons.Add(angle.ToString("0") + "=" + why);
         }
         var shut = Nearby<Door>(origin, 3f).FirstOrDefault();
-        Logger.LogInfo("Nowhere to step from " + Vector3ToConfig(origin) + ": " + string.Join("; ", reasons) +
-                       (shut ? " (a door is within reach and did not open)" : ""));
+        return string.Join("; ", reasons) + (shut ? " (a door is within reach and did not open)" : "");
+    }
+    void ExplainBlocked(Vector3 origin, Vector3 desired, int mask) {
+        if (Time.time - lastExplain < 5f) return;
+        lastExplain = Time.time;
+        Logger.LogInfo("Nowhere to step from " + Vector3ToConfig(origin) + ": " + Probes(origin, desired, mask));
     }
     // How far he can see along a heading before something stops him.
     static float Clearance(Vector3 origin, Vector3 direction, int mask, float range) {
