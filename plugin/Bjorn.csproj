@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Bjorn</AssemblyName>
+    <GameDir Condition="'$(GameDir)' == ''">/home/apel-xps/.local/share/Steam/steamapps/common/Valheim</GameDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="$(GameDir)/valheim_Data/Managed/assembly_*.dll;$(GameDir)/valheim_Data/Managed/UnityEngine*.dll;$(GameDir)/valheim_Data/Managed/Newtonsoft.Json.dll;$(GameDir)/valheim_Data/Managed/Splatform.dll" Private="false" />
+    <Reference Include="../.tools/bepinex/BepInExPack_Valheim/BepInEx/core/BepInEx.dll" Private="false" />
+    <Reference Include="../.tools/bepinex/BepInExPack_Valheim/BepInEx/core/0Harmony.dll" Private="false" />
+  </ItemGroup>
+</Project>

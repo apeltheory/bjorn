@@ -1,0 +1,12 @@
+.tools/
+.env
+__pycache__/
+plugin/bin/
+plugin/obj/
+runtime/
+
+# Belt and braces: never publish game binaries or downloaded packages.
+*.dll
+*.zip
+*.so
+*.dylib

@@ -1,0 +1,1957 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using BepInEx;
+using BepInEx.Configuration;
+using HarmonyLib;
+using Newtonsoft.Json;
+using UnityEngine;
+using UnityEngine.Networking;
+
+namespace Bjorn {
+[BepInPlugin("local.bjorn.companion", "Bjorn", "0.4.0")]
+public class Companion : BaseUnityPlugin {
+    internal static Companion Instance;
+    // Jobs are the only orders that need steering every tick. Everything else
+    // finishes inside Receive or Decide and leaves the bot standing.
+    enum Job { None, Follow, Come, Home, Bed, Fetch, Harvest, Chop, Mine, Fight, Haul, Mend, Resume, Patrol, Grave, Deliver, Escort, Mule }
+    // Outcome of one tick of walking toward a point.
+    enum Step { Moving, Arrived, Blocked, Stuck }
+    const float TargetSeconds = 30f; // Abandon one tree, rock, or foe that will not fall.
+    ConfigEntry<string> botName, tokenFile, homePosition, bedPosition, waypoints;
+    ConfigEntry<float> jobRadius, jobMinutes, guardRadius;
+    ConfigEntry<bool> botEnabled, defendSelf, pileOver;
+    ConfigEntry<KeyboardShortcut> toggleKey;
+    UnityWebRequest pendingRequest;
+    Harmony harmony;
+    Job job;
+    Player target;
+    Bed bed;
+    Vector3 destination;
+    Vector3 anchor;
+    string sweepFilter;
+    int collected, hauls;
+    float sweepUntil, reachedAt, swingUntil;
+    Component sweepTarget;
+    Job errand;  // The sweep to pick back up after a run home; None when not hauling.
+    Character threat;      // What he is fighting right now, whatever job he was on.
+    Character hurtBy;      // Whoever last actually landed a hit on him.
+    float hurtAt;
+    Vector3 fightFrom;     // Where a self-defence fight started, so he does not chase far.
+    float threatScan, lastShout, grazeCheck, morselScan, lastBeg, morselAt, hungrySince;
+    int begged;
+    ItemDrop morsel;   // Food on the ground he is walking over to collect.
+    ItemDrop salvage;  // Anything on the ground he is collecting while acting as a mule.
+    float salvageScan, salvageAt;
+    int muled;
+    int patrolStep;
+    float patrolRing;
+    Vector3 graveSpot;
+    bool graveKnown;
+    Player deliverTo;      // Who is owed a delivery once the fetching is done.
+    string deliverFilter;
+    readonly HashSet<int> visited = new HashSet<int>();
+    // Spots he has dumped a load at during this job. His own sweeps skip them, or he
+    // would collect his own pile, fill up, carry it back and pile it again forever.
+    readonly List<Vector3> piles = new List<Vector3>();
+    readonly Dictionary<string, Vector3> places = new Dictionary<string, Vector3>();
+    bool busy;
+    int generation;
+    float lastOrder, lastDeaf, lastBanter, stuckTime;
+    int bantered;
+    float avoidUntil;
+    float jumpUntil;
+    Vector3 avoidDirection;
+    Vector3 previous;
+    static readonly FieldInfo move = AccessTools.Field(typeof(Character), "m_moveDir");
+    static readonly FieldInfo autorun = AccessTools.Field(typeof(Player), "m_autoRun");
+    // Spoken phrase to Valheim's emote id. Only "sit" is a held pose; the rest play once.
+    static readonly Dictionary<string, string> emotes = new Dictionary<string, string> {
+        {"wave", "wave"}, {"sit", "sit"}, {"sit down", "sit"}, {"challenge", "challenge"},
+        {"cheer", "cheer"}, {"no no no", "nonono"}, {"thumbs up", "thumbsup"}, {"point", "point"},
+        {"blow kiss", "blowkiss"}, {"bow", "bow"}, {"cower", "cower"}, {"cry", "cry"},
+        {"despair", "despair"}, {"flex", "flex"}, {"beckon", "comehere"}, {"headbang", "headbang"},
+        {"kneel", "kneel"}, {"laugh", "laugh"}, {"roar", "roar"}, {"shrug", "shrug"},
+        {"dance", "dance"}, {"relax", "relax"}, {"toast", "toast"}, {"rest", "rest"},
+        {"vibe", "vibe"}, {"love you", "loveyou"},
+    };
+    internal bool Active => botEnabled.Value && Player.m_localPlayer != null;
+    bool IsSweep => job == Job.Fetch || job == Job.Harvest || job == Job.Chop || job == Job.Mine || job == Job.Fight;
+    float SweepRadius => Mathf.Clamp(jobRadius.Value, 5f, 100f);
+    float SweepSeconds => Mathf.Clamp(jobMinutes.Value, 0.5f, 120f) * 60f;
+    float GuardSpan => Mathf.Clamp(guardRadius.Value, 8f, 120f);
+
+    void Awake() {
+        Instance = this;
+        botEnabled = Config.Bind("Bot", "Enabled", true, "Automatic controls. Toggle in-game with ToggleKey; manual mode ignores orders.");
+        toggleKey = Config.Bind("Bot", "ToggleKey", new KeyboardShortcut(KeyCode.F8), "Switch between manual and bot control.");
+        botName = Config.Bind("Bot", "Name", "Bjorn", "Address chat with this name followed by a space, comma, or colon.");
+        homePosition = Config.Bind("Bot", "HomePosition", "", "Legacy single home position; imported into Waypoints on first load.");
+        bedPosition = Config.Bind("Bot", "BedPosition", "", "Saved bed position written by 'claim this bed'.");
+        waypoints = Config.Bind("Bot", "Waypoints", "", "Named places as name=x,y,z separated by semicolons. 'home' is where he unloads a full pack.");
+        jobRadius = Config.Bind("Bot", "JobRadius", 25f, "How far from the spot he was ordered a gathering job may range, in metres (5-100).");
+        jobMinutes = Config.Bind("Bot", "JobMinutes", 15f, "How long one load of a gathering job may take before he gives up, in minutes (0.5-120). The clock restarts after each run home.");
+        guardRadius = Config.Bind("Bot", "GuardRadius", 30f, "How far from a camp's centre counts as inside it while on guard, in metres (8-120).");
+        pileOver = Config.Bind("Bot", "PileWhenNoChest", true, "On a run home, leave anything the chest cannot take on the ground rather than stopping the job. Dropped items persist in Valheim.");
+        defendSelf = Config.Bind("Bot", "DefendSelf", true, "Fight back at anything hostile that comes close while doing other work. Guard duty ignores this and always fights.");
+        tokenFile = Config.Bind("Bridge", "TokenFile", "/home/apel-xps/Work/valheim-companion/runtime/bridge.token", "Local bridge token file.");
+        LoadPlaces();
+        harmony = new Harmony("local.bjorn.companion");
+        harmony.PatchAll();
+        Application.runInBackground = true;
+        Logger.LogInfo("Bjorn ready. Any nearby player can address orders to Bjorn.");
+    }
+    void Update() {
+        var player = Player.m_localPlayer;
+        if (!player || !Application.isFocused || !toggleKey.Value.IsDown()) return;
+        generation++; // Reject late decisions even if bot mode is re-enabled immediately.
+        Halt();
+        pendingRequest?.Abort();
+        autorun.SetValue(player, false);
+        player.SetControls(Vector3.zero, false, false, false, false, false, false, false, false, false, false);
+        move.SetValue(player, Vector3.zero);
+        botEnabled.Value = !botEnabled.Value;
+        Config.Save();
+        string status = botEnabled.Value ? "Bjorn: BOT control — awaiting orders" : "Bjorn: MANUAL control — you have control";
+        MessageHud.instance?.ShowMessage(MessageHud.MessageType.Center, status);
+        Logger.LogInfo(status);
+    }
+    void OnDestroy() { harmony?.UnpatchSelf(); Instance = null; }
+    void Say(string text) {
+        if (Chat.instance && !string.IsNullOrWhiteSpace(text))
+            Chat.instance.SendText(Talker.Type.Normal, text.Substring(0, Math.Min(180, text.Length)));
+    }
+    void Halt(string reason = null) {
+        job = Job.None; errand = Job.None; target = null; bed = null; sweepTarget = null; threat = null;
+        deliverTo = null; deliverFilter = null; morsel = null;
+        sweepFilter = null; visited.Clear(); piles.Clear(); stuckTime = 0; reachedAt = 0f;
+        if (reason != null) { Logger.LogInfo("Stopped: " + reason); Say(reason); }
+    }
+    // Clear any running job and start a fresh one from the bot's current spot.
+    void Begin(Job next) { Halt(); job = next; previous = Player.m_localPlayer.transform.position; }
+    static bool Any(string value, params string[] options) { return options.Contains(value); }
+    // Abuse gets answered in kind. Matched on whole words so "assess" and "Scunthorpe"
+    // do not set him off.
+    static readonly HashSet<string> curses = new HashSet<string> {
+        "fuck", "fucking", "fucker", "fucked", "shit", "shite", "shitty", "bullshit",
+        "bastard", "cunt", "prick", "dick", "arse", "ass", "asshole", "arsehole",
+        "twat", "wanker", "bollocks", "bitch", "damn", "goddamn", "piss", "crap",
+        "tosser", "knob", "idiot", "moron", "useless", "stupid", "pathetic", "worthless",
+    };
+    static readonly string[] comebacks = {
+        "Fuck me sideways, the little jarl has opinions. Swing an axe before you swing your mouth.",
+        "Piss off. I have shat in colder forests than the one you were born in.",
+        "By Odin's hairy arse, keep talking and I will go back to the fucking trees.",
+        "Big words from a man who cannot carry his own bloody wood. Fuck you too.",
+        "Say that again and I will drop this whole bastard load in the sea.",
+        "You kiss your mother with that mouth? Mine is dead, so I will say what I like.",
+        "Careful, little one. I have butchered things politer than you before breakfast.",
+        "Ha! That is the most spirit you have shown all sodding day. Now help me carry this shit.",
+        "I am a grown fucking Viking and I will not be spoken to like a draugr's arse.",
+        "Grumble all you want, you soft-handed shit. The wood still needs chopping.",
+        "Arse. Piss. Bollocks. There, now we have both said our piece. Back to work.",
+        "That is rich from someone who dies to greylings. Fuck off and let me swing.",
+    };
+    static bool Cursing(string simple) {
+        foreach (var word in simple.Split(new[] { ' ', ',', '.', '!', '?', ';', ':', '\'', '"', '-' }, StringSplitOptions.RemoveEmptyEntries))
+            if (curses.Contains(word)) return true;
+        return false;
+    }
+    // Splits "deposit iron" into the verb and the original-case remainder. `simple`
+    // only differs from `order` in case and trailing punctuation, so offsets line up.
+    static bool Prefixed(string simple, string order, string head, out string rest) {
+        rest = null;
+        if (!simple.StartsWith(head, StringComparison.Ordinal)) return false;
+        rest = order.Substring(head.Length).Trim(' ', ',', '.', '!', '?');
+        return rest.Length > 0;
+    }
+    // People do not say "wood", they say "some wood" or "the wood, please". Those pad
+    // words otherwise become part of the name and match nothing.
+    static readonly HashSet<string> filler = new HashSet<string> {
+        "some", "a", "an", "the", "my", "your", "our", "any", "more", "all",
+        "please", "now", "up", "of", "that", "this", "it", "for", "me", "us",
+    };
+    static string Bare(string text) {
+        string value = Normalize(text);
+        if (value == null) return null;
+        var words = value.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+        while (words.Count > 0 && filler.Contains(words[0])) words.RemoveAt(0);
+        while (words.Count > 0 && filler.Contains(words[words.Count - 1])) words.RemoveAt(words.Count - 1);
+        return words.Count == 0 ? null : string.Join(" ", words);
+    }
+    static string Normalize(string text) {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        return text.Trim().Trim('.', '!', '?').ToLowerInvariant();
+    }
+    internal void Receive(GameObject source, long senderId, string text) {
+        var me = Player.m_localPlayer;
+        if (text == null) return;
+        var prefix = botName.Value;
+        if (!text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || text.Length <= prefix.Length ||
+            " ,:".IndexOf(text[prefix.Length]) < 0) return;
+        if (!Active) {
+            Logger.LogInfo("Addressed order ignored: bot is in manual mode or not spawned.");
+            return;
+        }
+        // Nearby chat already supplies the speaking character. Object creation IDs
+        // need not match the peer ID delivering a chat RPC through a server.
+        var speaker = source ? source.GetComponent<Player>() : null;
+        if (!speaker && !source)
+            speaker = Player.GetAllPlayers().FirstOrDefault(p =>
+                p.GetComponent<ZNetView>()?.GetZDO()?.GetOwner() == senderId);
+        if (speaker == me) {
+            Logger.LogInfo("Addressed order ignored: sent from Bjorn's own character.");
+            return;
+        }
+        if (!speaker) {
+            Logger.LogInfo("Addressed order ignored: speaking player is not loaded nearby.");
+            return;
+        }
+        var order = text.Substring(prefix.Length).Trim(' ', ',', ':');
+        if (order.Length == 0 || order.Length > 500) return;
+        var simple = order.ToLowerInvariant().TrimEnd('.', '!');
+        var plain = simple.TrimEnd('?');
+        if (Any(plain, "what can you do", "help", "commands", "what commands do you know")) { Help(); return; }
+        if (Any(simple, "stay", "stop", "wait", "wait here", "stay here")) {
+            generation++; Halt("I'll hold here."); return;
+        }
+        // Answered before the cooldown gate so an insult always lands, but rate-limited
+        // so he cannot be goaded into spamming the whole server's chat.
+        if (Cursing(simple)) {
+            if (Time.unscaledTime - lastBanter > 4) {
+                lastBanter = Time.unscaledTime;
+                Say(comebacks[bantered++ % comebacks.Length]);
+            }
+            return;
+        }
+        // Everything past this point acts on the world, so it waits its turn behind a
+        // pending planner request and behind the order cooldown.
+        if (busy || Time.unscaledTime - lastOrder < 2) {
+            // Say so rather than going quiet: silence is indistinguishable from not
+            // having heard, and prompts the rephrase that blocks the next order too.
+            Logger.LogInfo("Addressed order ignored: planner busy or command cooldown.");
+            if (Time.unscaledTime - lastDeaf > 5) { lastDeaf = Time.unscaledTime; Say(busy ? "One thing at a time — I'm still thinking." : "A moment."); }
+            return;
+        }
+        Logger.LogInfo("Accepted addressed order from a nearby player.");
+        lastOrder = Time.unscaledTime;
+        if (Any(simple, "follow", "follow me")) { Follow(speaker); return; }
+        if (Any(simple, "come", "come here", "come to me", "over here")) { Come(speaker); return; }
+        if (Any(plain, "inventory", "what are you carrying")) { Inventory(); return; }
+        if (Any(plain, "status", "report", "how are you", "how are you holding up", "how do you fare")) { Status(); return; }
+        if (Any(plain, "where are you", "where", "location", "position")) { Where(); return; }
+        if (Any(plain, "look around", "what do you see", "scan", "what is nearby", "anything nearby")) { Scan(); return; }
+        if (Any(plain, "self test", "selftest", "sound off", "check yourself", "diagnostics", "are you working")) { SelfTest(); return; }
+        if (Any(simple, "set home")) { RememberPlace("home"); return; }
+        if (Any(plain, "what places do you know", "list places", "places", "waypoints", "where can you go")) { ListPlaces(); return; }
+        // Bed phrases are matched before the "go to <place>" and "remember this as
+        // <place>" forms so a bed never becomes a waypoint called "bed".
+        if (Any(simple, "claim this bed", "claim bed", "remember this bed")) { ClaimNearbyBed(); return; }
+        if (Any(simple, "go to bed", "go bed", "sleep")) { GoToBed(); return; }
+        if (Any(simple, "go home", "return home", "come home")) { GoHome(); return; }
+        if (Any(simple, "repair", "repair your gear", "repair your stuff", "repair your kit", "repair yourself",
+                        "fix your gear", "fix your stuff", "mend your gear", "mend your kit", "mend")) { Repair(); return; }
+        if (Any(simple, "eat", "eat up", "eat something", "have a bite", "get some food in you", "feed yourself")) { EatBest(); return; }
+        if (Any(simple, "gather", "loot", "pick up the loot", "collect the drops", "pick up items")) { Fetch(null); return; }
+        if (Any(simple, "harvest", "forage", "pick berries", "pick what you can")) { Harvest(null); return; }
+        if (Any(simple, "chop", "chop wood", "cut wood", "fell trees", "chop trees", "gather wood")) { Chop(); return; }
+        if (Any(simple, "mine", "mine stone", "mine ore", "break rocks", "gather stone")) { Mine(); return; }
+        if (Any(simple, "fight", "attack", "defend me", "defend", "guard me", "kill it")) { Fight(null); return; }
+        if (Any(simple, "guard", "patrol", "stand guard", "guard the camp", "patrol the camp", "watch the camp", "guard home", "keep watch")) { Guard(null); return; }
+        if (Any(simple, "fight with me", "help me fight", "join me", "on me", "watch my back", "with me", "cover me", "let's hunt", "lets hunt", "boss hunt", "to arms")) { Escort(speaker); return; }
+        if (Any(simple, "mule", "be my mule", "carry for me", "carry my loot", "haul for me", "pick up after me", "porter")) { Mule(speaker); return; }
+        if (Any(simple, "take it home", "take it to base", "drop it at base", "unload at home", "run it home", "take it back")) { HaulNow(speaker); return; }
+        if (Any(simple, "gear up", "arm yourself", "put your gear on")) { GearUp(me); Inventory(); return; }
+        if (Any(simple, "get your gear", "fetch your grave", "go to your grave", "recover your gear")) {
+            if (graveKnown) AfterRespawn(); else Say("I have no grave to go back to.");
+            return;
+        }
+        if (Any(simple, "take everything", "take all", "empty the chest", "loot the chest")) { Withdraw(null); return; }
+        if (Any(simple, "drop everything", "drop all", "drop your pack")) { DropAll(); return; }
+        if (Any(simple, "drop it here", "dump it", "dump your pack", "pile it here", "pile it up", "leave it here", "stack it here")) {
+            int piled = Pile(me);
+            Say(piled == 0 ? "I've nothing worth piling up." :
+                "Piled " + piled + (piled == 1 ? " stack" : " stacks") + " here. My gear stays with me.");
+            return;
+        }
+        if (Any(simple, "feed the fire", "stoke the fire", "tend the fire", "add wood to the fire")) { FeedFire(); return; }
+        if (Any(simple, "open the door", "open door", "open")) { UseDoor(true); return; }
+        if (Any(simple, "close the door", "close door", "close", "shut the door")) { UseDoor(false); return; }
+        if (Any(simple, "deposit", "stash", "unload", "empty your pack", "put everything in the chest")) { Deposit(null); return; }
+        if (Any(simple, "unequip all", "put your gear away", "stow your gear")) { UnequipAll(); return; }
+        // Each verb below only claims the order if it can actually find what was
+        // named. "drop everything and follow me" or "pick a fight" find nothing, so
+        // they fall past these lines to the planner, which reads the whole sentence.
+        string rest;
+        if (Prefixed(simple, order, "remember this as ", out rest) && RememberPlace(rest)) return;
+        if (Prefixed(simple, order, "remember this place as ", out rest) && RememberPlace(rest)) return;
+        if (Prefixed(simple, order, "remember here as ", out rest) && RememberPlace(rest)) return;
+        if (Prefixed(simple, order, "guard ", out rest) && Guard(rest)) return;
+        if (Prefixed(simple, order, "patrol ", out rest) && Guard(rest)) return;
+        if (Prefixed(simple, order, "go to ", out rest) && GoToPlace(rest)) return;
+        if (Prefixed(simple, order, "head to ", out rest) && GoToPlace(rest)) return;
+        if (Prefixed(simple, order, "forget ", out rest) && ForgetPlace(rest)) return;
+        if (Prefixed(simple, order, "pick up ", out rest) && Fetch(rest)) return;
+        if (Prefixed(simple, order, "gather ", out rest) && Fetch(rest)) return;
+        if (Prefixed(simple, order, "harvest ", out rest) && Harvest(rest)) return;
+        if (Prefixed(simple, order, "pick ", out rest) && Harvest(rest)) return;
+        if (Prefixed(simple, order, "deposit ", out rest) && Deposit(rest)) return;
+        if (Prefixed(simple, order, "stash ", out rest) && Deposit(rest)) return;
+        if (Prefixed(simple, order, "bring me ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "fetch me ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "hand me ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "get me ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "bring ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "find ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "give me ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "toss me ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "throw me ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "pass me ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "drop ", out rest) && DropNamed(rest)) return;
+        if (Prefixed(simple, order, "toss ", out rest) && DropNamed(rest)) return;
+        if (Prefixed(simple, order, "unequip ", out rest) && UnequipNamed(rest)) return;
+        if (Prefixed(simple, order, "craft ", out rest) && Craft(rest)) return;
+        if (Prefixed(simple, order, "make ", out rest) && Craft(rest)) return;
+        if (Prefixed(simple, order, "attack ", out rest) && Fight(rest)) return;
+        if (Prefixed(simple, order, "kill ", out rest) && Fight(rest)) return;
+        if (Prefixed(simple, order, "take ", out rest) && Withdraw(rest)) return;
+        if (Prefixed(simple, order, "eat ", out rest) && (EatNamed(rest) || Bare(rest) == null && EatBest())) return;
+        if (Prefixed(simple, order, "equip ", out rest) && EquipNamed(rest)) return;
+        if (Prefixed(simple, order, "emote ", out rest) && Emote(Normalize(rest))) return;
+        if (Emote(simple)) return;
+        Logger.LogInfo("No direct command matched; asking the planner to read it.");
+        StartCoroutine(Decide(order, speaker, ++generation));
+    }
+    void Follow(Player speaker) { Begin(Job.Follow); target = speaker; Logger.LogInfo("Follow target set."); Say("I'll follow your lead."); }
+    void Come(Player speaker) { Begin(Job.Come); target = speaker; Say("I'm coming to you."); }
+    // Sticks with you and fights what you are fighting, bosses first, and will not
+    // quit the job when hurt - he backs off, heals, and closes again.
+    void Escort(Player speaker) {
+        Begin(Job.Escort);
+        target = speaker;
+        GearUp(Player.m_localPlayer);
+        var weapon = Player.m_localPlayer.GetCurrentWeapon();
+        Say(weapon == null ? "I'm with you, though I've no weapon to raise."
+            : "I'm with you. My " + Localization.instance.Localize(weapon.m_shared.m_name) + " is yours — point me at it.");
+    }
+    void GoHome() {
+        if (!GoToPlace("home")) Say("I have no home remembered yet. Stand where you want it and say 'remember this as home'.");
+    }
+    void ClaimNearbyBed() {
+        var player = Player.m_localPlayer;
+        var found = Nearest<Bed>(player.transform.position, 4f);
+        if (!found) { Say("No bed is near enough to claim."); return; }
+        found.Interact(player, false, false);
+        bedPosition.Value = Vector3ToConfig(found.transform.position);
+        Config.Save();
+        Say("This bed is remembered. I’ll return here when called.");
+    }
+    void GoToBed() {
+        if (!TryParsePosition(bedPosition.Value, out var saved)) { Say("I have no bed remembered yet."); return; }
+        var found = Nearest<Bed>(saved, 3f);
+        if (!found) { Say("I cannot see the remembered bed here."); return; }
+        Begin(Job.Bed); bed = found; destination = found.transform.position;
+        Say("I’m going to my bed.");
+    }
+    static string Vector3ToConfig(Vector3 value) { return value.x.ToString("R") + "," + value.y.ToString("R") + "," + value.z.ToString("R"); }
+    bool TryParsePosition(string text, out Vector3 value) {
+        value = Vector3.zero;
+        var parts = text.Split(',');
+        return parts.Length == 3 && float.TryParse(parts[0], out value.x) && float.TryParse(parts[1], out value.y) && float.TryParse(parts[2], out value.z);
+    }
+    bool TryParseHome(out Vector3 value) { return places.TryGetValue("home", out value); }
+
+    // ---- Named places ----------------------------------------------------
+
+    // Stored as "name=x,y,z;name=x,y,z". A pre-0.4 HomePosition is imported once so
+    // an existing waypoint is not lost.
+    void LoadPlaces() {
+        places.Clear();
+        foreach (var entry in waypoints.Value.Split(';')) {
+            int split = entry.IndexOf('=');
+            if (split <= 0) continue;
+            string name = PlaceName(entry.Substring(0, split));
+            if (name != null && TryParsePosition(entry.Substring(split + 1), out var position)) places[name] = position;
+        }
+        if (!places.ContainsKey("home") && TryParsePosition(homePosition.Value, out var legacy)) {
+            places["home"] = legacy;
+            SavePlaces();
+        }
+    }
+    void SavePlaces() {
+        waypoints.Value = string.Join(";", places.Select(p => p.Key + "=" + Vector3ToConfig(p.Value)));
+        Config.Save();
+    }
+    // "the Mine!" becomes "mine". Separators would corrupt the config line, so a name
+    // containing one is refused rather than silently mangled.
+    static string PlaceName(string raw) {
+        string name = Normalize(raw);
+        if (name == null) return null;
+        if (name.StartsWith("the ", StringComparison.Ordinal)) name = name.Substring(4).Trim();
+        if (name.Length == 0 || name.Length > 40 || name.IndexOf('=') >= 0 || name.IndexOf(';') >= 0) return null;
+        return name;
+    }
+    bool RememberPlace(string raw) {
+        string name = PlaceName(raw);
+        if (name == null) return false;
+        places[name] = Player.m_localPlayer.transform.position;
+        SavePlaces();
+        Say(name == "home" ? "This place is home now. I'll bring full loads back here." : "I'll remember this place as the " + name + ".");
+        return true;
+    }
+    bool GoToPlace(string raw) {
+        string name = PlaceName(raw);
+        if (name == null || !places.TryGetValue(name, out var position)) return false;
+        Begin(Job.Home); destination = position;
+        Say(name == "home" ? "I know the way home. I’m heading back." : "Heading for the " + name + ".");
+        return true;
+    }
+    bool ForgetPlace(string raw) {
+        string name = PlaceName(raw);
+        if (name == null || !places.Remove(name)) return false;
+        SavePlaces();
+        Say("The " + name + " is forgotten.");
+        return true;
+    }
+    void ListPlaces() {
+        if (places.Count == 0) { Say("I know no places yet. Say 'remember this as home'."); return; }
+        var here = Player.m_localPlayer.transform.position;
+        Say("Places I know: " + string.Join(", ", places.OrderBy(p => p.Key)
+            .Select(p => p.Key + " (" + Mathf.RoundToInt(Vector3.Distance(here, p.Value)) + " paces " + Compass(p.Value - here) + ")")));
+    }
+
+    // ---- Reporting -------------------------------------------------------
+
+    void Inventory() {
+        var items = Player.m_localPlayer.GetInventory().GetAllItems();
+        var names = items.GroupBy(i => i.m_shared.m_name).Select(g => Localization.instance.Localize(g.Key) + " x" + g.Sum(i => i.m_stack));
+        Say(items.Count == 0 ? "My pack is empty." : "In my pack: " + string.Join(", ", names));
+    }
+    string JobWord() {
+        switch (job) {
+            case Job.Follow: return target ? "following " + target.GetPlayerName() : "following";
+            case Job.Come: return "on my way to you";
+            case Job.Escort: return target ? "fighting alongside " + target.GetPlayerName() : "fighting alongside you";
+            case Job.Mule: return "carrying for you, " + muled + " picked up so far";
+            case Job.Home: return "walking home";
+            case Job.Bed: return "walking to my bed";
+            case Job.Fetch: return "gathering what has fallen";
+            case Job.Harvest: return "foraging";
+            case Job.Chop: return "felling trees";
+            case Job.Mine: return "breaking rock";
+            case Job.Fight: return "in a fight";
+            case Job.Patrol: return "on guard";
+            case Job.Mend: return "off to mend my gear";
+            case Job.Grave: return "going back for my gear";
+            case Job.Deliver: return "bringing you " + (deliverFilter ?? "something");
+            case Job.Haul: return "carrying a full pack home";
+            case Job.Resume: return "walking back to the job";
+            default: return "standing ready";
+        }
+    }
+    void Status() {
+        var me = Player.m_localPlayer;
+        var parts = new List<string> {
+            "Health " + Mathf.RoundToInt(me.GetHealth()) + " of " + Mathf.RoundToInt(me.GetMaxHealth()),
+            "stamina " + Mathf.RoundToInt(me.GetStamina()) + " of " + Mathf.RoundToInt(me.GetMaxStamina())
+        };
+        var foods = me.GetFoods().Where(f => f.m_item != null)
+            .Select(f => Localization.instance.Localize(f.m_item.m_shared.m_name)).ToList();
+        parts.Add(foods.Count == 0 ? "nothing in my belly" : "fed on " + string.Join(" and ", foods));
+        var seman = me.GetSEMan();
+        var marks = new List<string>();
+        if (seman.HaveStatusEffect(SEMan.s_statusEffectRested)) marks.Add("rested");
+        if (seman.HaveStatusEffect(SEMan.s_statusEffectWet)) marks.Add("wet");
+        if (seman.HaveStatusEffect(SEMan.s_statusEffectCold) || seman.HaveStatusEffect(SEMan.s_statusEffectFreezing)) marks.Add("cold");
+        if (marks.Count > 0) parts.Add(string.Join(" and ", marks));
+        parts.Add(JobWord());
+        Say(string.Join(", ", parts) + ".");
+    }
+    // Everything the first in-game session needs to know, in one order, touching
+    // nothing. "It does not work" becomes a specific line.
+    void SelfTest() {
+        var me = Player.m_localPlayer;
+        var here = me.transform.position;
+        Say("Bjorn " + Info.Metadata.Version + ", bot control on, " + JobWord() + ".");
+
+        Say(places.Count == 0
+            ? "No places remembered. Say 'remember this as home' by a chest."
+            : "Places: " + string.Join(", ", places.OrderBy(x => x.Key)
+                .Select(x => x.Key + " " + Mathf.RoundToInt(Vector3.Distance(here, x.Value)) + " paces " + Compass(x.Value - here)))
+              + (TryParsePosition(bedPosition.Value, out _) ? ". Bed remembered." : ". No bed."));
+
+        int chests = Nearby<Container>(here, 8f).Count();
+        var station = me.GetCurrentCraftingStation();
+        Say("Around me: " + (chests == 0 ? "no chest" : chests + (chests == 1 ? " chest" : " chests")) + ", " +
+            (station ? Localization.instance.Localize(station.m_name) + " in range" : "no station in range") + ", " +
+            Nearby<ItemDrop>(here, 12f).Count(d => !d.IsPiece()) + " items on the ground.");
+
+        Say("Kit: " + Tool(Skills.SkillType.Axes, "axe") + ", " + Tool(Skills.SkillType.Pickaxes, "pickaxe") + ", " +
+            (WeaponWord() ?? "no weapon") + ", " +
+            me.GetInventory().GetAllItems().Count(i => i.m_equipped && i.GetArmor() > 0f) + " armour worn.");
+
+        var foods = me.GetFoods().Count;
+        Say("Belly: " + foods + " of 3 slots" + (CarriesFood(me) ? ", food in the pack." : ", nothing to eat in the pack.") +
+            " Health " + Mathf.RoundToInt(me.GetHealth()) + ", stamina " + Mathf.RoundToInt(me.GetStamina()) + ".");
+
+        bool bridge;
+        try { bridge = File.ReadAllText(tokenFile.Value).Trim().Length > 0; } catch { bridge = false; }
+        Say(bridge ? "I can reach my thoughts. Ask me something I don't know a word for."
+                   : "No bridge token, so no Claude. Direct orders still work.");
+    }
+    // Names the best tool of a kind and how worn it is, or says he has none.
+    string Tool(Skills.SkillType kind, string word) {
+        var best = Player.m_localPlayer.GetInventory().GetAllItems()
+            .Where(i => i.m_shared.m_skillType == kind && i.IsEquipable())
+            .OrderByDescending(i => i.m_shared.m_toolTier).FirstOrDefault();
+        if (best == null) return "no " + word;
+        float max = best.GetMaxDurability();
+        int wear = max > 0f ? Mathf.RoundToInt(best.m_durability / max * 100f) : 100;
+        return Localization.instance.Localize(best.m_shared.m_name) + " " + wear + "%";
+    }
+    string WeaponWord() {
+        var held = Player.m_localPlayer.GetCurrentWeapon();
+        return held != null && held.IsWeapon() ? "holding " + Localization.instance.Localize(held.m_shared.m_name) : null;
+    }
+    void Where() {
+        var position = Player.m_localPlayer.transform.position;
+        var text = "I stand in the " + Spaced(Heightmap.FindBiome(position).ToString()) +
+                   " at " + Mathf.RoundToInt(position.x) + ", " + Mathf.RoundToInt(position.z) + ".";
+        if (TryParseHome(out var home)) {
+            var delta = home - position; delta.y = 0;
+            text += " Home lies " + Mathf.RoundToInt(delta.magnitude) + " paces " + Compass(delta) + ".";
+        }
+        Say(text);
+    }
+    void Scan() {
+        var me = Player.m_localPlayer;
+        var position = me.transform.position;
+        var creatures = Character.GetAllCharacters()
+            .Where(c => c && c != me && !c.IsDead() && Vector3.Distance(c.transform.position, position) <= 30f).ToList();
+        var parts = new List<string>();
+        var beasts = creatures.Where(c => !c.IsPlayer() && !c.IsTamed()).ToList();
+        if (beasts.Count > 0)
+            parts.Add(string.Join(", ", beasts.GroupBy(c => Localization.instance.Localize(c.m_name))
+                .OrderByDescending(g => g.Count()).Take(3).Select(g => g.Count() + " " + g.Key)));
+        int tamed = creatures.Count(c => c.IsTamed());
+        if (tamed > 0) parts.Add(tamed + " tamed");
+        int others = creatures.Count(c => c.IsPlayer());
+        if (others > 0) parts.Add(others + (others == 1 ? " other viking" : " other vikings"));
+        int chests = Nearby<Container>(position, 30f).Count();
+        if (chests > 0) parts.Add(chests + (chests == 1 ? " chest" : " chests"));
+        int forage = Nearby<Pickable>(position, 30f).Count(p => p.CanBePicked());
+        if (forage > 0) parts.Add(forage + " to forage");
+        int drops = Nearby<ItemDrop>(position, 30f).Count(d => !d.IsPiece());
+        if (drops > 0) parts.Add(drops + (drops == 1 ? " dropped item" : " dropped items"));
+        Say(parts.Count == 0 ? "Nothing stirs within thirty paces." : "Within thirty paces: " + string.Join("; ", parts) + ".");
+    }
+    static string Spaced(string name) {
+        var text = new StringBuilder();
+        foreach (char letter in name) {
+            if (char.IsUpper(letter) && text.Length > 0) text.Append(' ');
+            text.Append(letter);
+        }
+        return text.ToString();
+    }
+    static string Compass(Vector3 delta) {
+        // Valheim's map puts north along +Z.
+        string[] points = { "north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west" };
+        float angle = (Mathf.Atan2(delta.x, delta.z) * Mathf.Rad2Deg + 360f) % 360f;
+        return points[Mathf.RoundToInt(angle / 45f) % 8];
+    }
+
+    // ---- Items -----------------------------------------------------------
+
+    // Names are compared with case, spaces and punctuation stripped, so "torch",
+    // "Torch", "wood arrows" and the "WoodArrow" prefab all answer to each other.
+    // The untranslated "$item_torch" token is matched too, in case localization
+    // has not loaded on this client.
+    static string Key(string text) {
+        if (text == null) return "";
+        var builder = new StringBuilder();
+        foreach (char letter in text) if (char.IsLetterOrDigit(letter)) builder.Append(char.ToLowerInvariant(letter));
+        return builder.ToString();
+    }
+    static bool KeyMatches(string candidate, string key) {
+        if (key.Length == 0) return false;
+        string name = Key(candidate);
+        if (name == key) return true;
+        // A two-letter fragment is inside half the item list - "up" is in "turnip
+        // soup" - so only requests of real length are matched loosely.
+        return key.Length >= 3 && name.Contains(key);
+    }
+    static bool NameMatches(ItemDrop.ItemData item, string wanted) {
+        string key = Key(wanted);
+        return KeyMatches(Localization.instance.Localize(item.m_shared.m_name), key) ||
+               KeyMatches(item.m_shared.m_name, key) ||
+               (item.m_dropPrefab && KeyMatches(item.m_dropPrefab.name, key));
+    }
+    ItemDrop.ItemData FindItem(string requested, bool foodOnly, bool equipOnly) {
+        string wanted = Bare(requested);
+        if (wanted == null) return null;
+        var items = Player.m_localPlayer.GetInventory().GetAllItems();
+        var found = items.FirstOrDefault(item => {
+            if (foodOnly && item.m_shared.m_food <= 0f) return false;
+            if (equipOnly && !item.IsEquipable()) return false;
+            return NameMatches(item, wanted);
+        });
+        if (found == null)
+            Logger.LogInfo("No item matched '" + requested + "'. Carrying: " +
+                string.Join(", ", items.Select(i => Localization.instance.Localize(i.m_shared.m_name))));
+        return found;
+    }
+    // These return false when nothing in the pack answers to the name, which is the
+    // usual sign the sentence was never really an order — the planner reads it next.
+    bool EatNamed(string requested) {
+        var item = FindItem(requested, foodOnly: true, equipOnly: false);
+        if (item == null) return false;
+        Say(Player.m_localPlayer.EatFood(item) ? "I’ve eaten the " + Localization.instance.Localize(item.m_shared.m_name) + "." : "I cannot eat that yet.");
+        return true;
+    }
+    bool EquipNamed(string requested) {
+        var item = FindItem(requested, foodOnly: false, equipOnly: true);
+        if (item == null) return false;
+        Player.m_localPlayer.EquipItem(item);
+        Say("I’ve equipped the " + Localization.instance.Localize(item.m_shared.m_name) + ".");
+        return true;
+    }
+    bool UnequipNamed(string requested) {
+        string wanted = Bare(requested);
+        var me = Player.m_localPlayer;
+        var item = wanted == null ? null : me.GetInventory().GetAllItems().FirstOrDefault(i => i.m_equipped && NameMatches(i, wanted));
+        if (item == null) return false;
+        me.UnequipItem(item);
+        Say("I’ve stowed the " + Localization.instance.Localize(item.m_shared.m_name) + ".");
+        return true;
+    }
+    void UnequipAll() {
+        var me = Player.m_localPlayer;
+        var worn = me.GetInventory().GetAllItems().Where(i => i.m_equipped).ToList();
+        foreach (var item in worn) me.UnequipItem(item);
+        Say(worn.Count == 0 ? "My hands are already empty." : "Gear stowed — " + worn.Count + " pieces.");
+    }
+    // Drops at his own feet. `requested` may lead with a count ("10 wood"); without
+    // one he parts with every stack of it. DropItem unequips first, so he will hand
+    // over the axe in his hands if you ask for it by name.
+    bool DropNamed(string requested) {
+        var me = Player.m_localPlayer;
+        string wanted = Bare(requested);
+        if (wanted == null) return false;
+        int asked = SplitCount(ref wanted, cap: 9999, none: 0);  // 0 means "all of it"
+        var matching = me.GetInventory().GetAllItems().Where(i => NameMatches(i, wanted)).ToList();
+        if (matching.Count == 0) return false;
+        string name = Localization.instance.Localize(matching[0].m_shared.m_name);
+        int left = asked, given = 0;
+        foreach (var item in matching) {
+            int take = asked == 0 ? item.m_stack : Mathf.Min(left, item.m_stack);
+            if (take <= 0) break;
+            if (!me.DropItem(me.GetInventory(), item, take)) continue;
+            given += take;
+            if (asked != 0 && (left -= take) <= 0) break;
+        }
+        if (given == 0) { Say("I cannot part with the " + name + "."); return true; }
+        Say("There — " + given + " " + name + (asked != 0 && given < asked ? ", which is all I had." : " for you."));
+        return true;
+    }
+    // Moves unequipped items into a chest and reports how many stacks went in.
+    // `full` tells the caller the chest ran out of room rather than the pack being empty.
+    // What an automatic haul is willing to part with. Told to deposit explicitly he
+    // will hand over anything, but a haul mid-job must not leave him without his axe,
+    // his food or his torch.
+    static bool Spare(ItemDrop.ItemData item) {
+        if (item.m_shared.m_food > 0f) return false;
+        switch (item.m_shared.m_itemType) {
+            case ItemDrop.ItemData.ItemType.Material:
+            case ItemDrop.ItemData.ItemType.Trophy:
+            case ItemDrop.ItemData.ItemType.Fish:
+                return true;
+            default:
+                return false;
+        }
+    }
+    int MoveInto(Container chest, string filter, bool keepKit, out bool full) {
+        full = false;
+        var me = Player.m_localPlayer;
+        var view = chest ? chest.GetComponent<ZNetView>() : null;
+        if (!view || !view.IsValid()) return 0;
+        // Owning the chest's ZDO is what lets its inventory write back to the world.
+        view.ClaimOwnership();
+        var into = chest.GetInventory();
+        int moved = 0;
+        foreach (var item in me.GetInventory().GetAllItems().ToList()) {
+            if (item.m_equipped) continue;
+            if (keepKit && !Spare(item)) continue;
+            if (filter != null && !NameMatches(item, filter)) continue;
+            if (!into.CanAddItem(item) || !into.AddItem(item)) { full = true; continue; }
+            me.GetInventory().RemoveItem(item);
+            moved++;
+        }
+        return moved;
+    }
+    bool Deposit(string requested) {
+        var me = Player.m_localPlayer;
+        string filter = Bare(requested);
+        var chest = Nearest<Container>(me.transform.position, 5f);
+        if (!chest) { Say("No chest stands close enough to fill. Say 'dump it' and I'll pile it here instead."); return true; }
+        var view = chest.GetComponent<ZNetView>();
+        if (!view || !view.IsValid()) { Say("That chest will not answer me."); return true; }
+        bool full;
+        int moved = MoveInto(chest, filter, false, out full);
+        if (moved == 0) {
+            if (filter != null && !full) return false;
+            Say(full ? "The chest has no room left. Say 'dump it' and I'll pile it here." : "I have nothing to put in there.");
+            return true;
+        }
+        Say("I put " + moved + (moved == 1 ? " stack" : " stacks") + " in the chest" + (full ? ", then it filled up." : "."));
+        return true;
+    }
+    bool Withdraw(string requested) {
+        var me = Player.m_localPlayer;
+        string filter = Bare(requested);
+        var chest = Nearest<Container>(me.transform.position, 5f);
+        if (!chest) {
+            // "take a look around" is not an order to raid a chest that is not there.
+            if (filter != null) return false;
+            Say("No chest stands close enough to open.");
+            return true;
+        }
+        var view = chest.GetComponent<ZNetView>();
+        if (!view || !view.IsValid()) { Say("That chest will not answer me."); return true; }
+        view.ClaimOwnership();
+        var from = chest.GetInventory();
+        int taken = 0;
+        bool full = false;
+        foreach (var item in from.GetAllItems().ToList()) {
+            if (filter != null && !NameMatches(item, filter)) continue;
+            if (!me.GetInventory().CanAddItem(item) || !me.GetInventory().AddItem(item)) { full = true; continue; }
+            from.RemoveItem(item);
+            taken++;
+        }
+        if (taken == 0) {
+            if (filter != null && !full) return false;
+            Say(full ? "My pack has no room for it." : "The chest holds nothing like that.");
+            return true;
+        }
+        Say("I took " + taken + (taken == 1 ? " stack" : " stacks") + " from the chest" + (full ? ", then my pack filled." : "."));
+        return true;
+    }
+    void DropAll() {
+        var me = Player.m_localPlayer;
+        var loose = me.GetInventory().GetAllItems().Where(i => !i.m_equipped).ToList();
+        int dropped = loose.Count(i => me.DropItem(me.GetInventory(), i, i.m_stack));
+        Say(dropped == 0 ? "I have nothing loose to drop." : "Dropped " + dropped + " stacks at my feet.");
+    }
+    void FeedFire() {
+        var me = Player.m_localPlayer;
+        var fire = Nearest<Fireplace>(me.transform.position, 5f);
+        if (!fire) { Say("No fire burns within reach."); return; }
+        int added = 0;
+        // Each interaction feeds one log. The alt flag skips the on/off toggle that
+        // some fires answer a plain use with.
+        while (added < 20 && fire.Interact(me, false, true)) added++;
+        Say(added == 0 ? "The fire wants nothing, or I carry no fuel for it." : "Fed the fire " + added + (added == 1 ? " log." : " logs."));
+    }
+    void UseDoor(bool wantOpen) {
+        var me = Player.m_localPlayer;
+        var door = Nearest<Door>(me.transform.position, 5f);
+        if (!door) { Say("There is no door within reach."); return; }
+        var view = door.GetComponent<ZNetView>();
+        bool open = view && view.IsValid() && view.GetZDO().GetInt(ZDOVars.s_state) != 0;
+        if (open == wantOpen) { Say(open ? "The door already stands open." : "The door is already shut."); return; }
+        Say(door.Interact(me, false, false) ? (wantOpen ? "Opened." : "Shut.") : "That door will not move for me.");
+    }
+    void Repair() {
+        var me = Player.m_localPlayer;
+        var station = me.GetCurrentCraftingStation();
+        if (!station) { Say("I must stand at a workbench or forge to mend anything."); return; }
+        if (!station.CheckUsable(me, false)) { Say("That station will not serve me."); return; }
+        var worn = new List<ItemDrop.ItemData>();
+        me.GetInventory().GetWornItems(worn);
+        int mended = 0;
+        foreach (var item in worn) {
+            if (!CanRepair(item, station)) continue;
+            me.RaiseSkill(Skills.SkillType.Crafting, 1f - item.m_durability / item.GetMaxDurability());
+            item.m_durability = item.GetMaxDurability();
+            mended++;
+        }
+        Say(mended == 0 ? "Nothing here needs mending." : "Mended " + mended + (mended == 1 ? " piece" : " pieces") + " of gear.");
+    }
+    // Mirrors Valheim's own repair test: the station must be the one the recipe
+    // names, at a high enough level.
+    static bool CanRepair(ItemDrop.ItemData item, CraftingStation station) {
+        if (!item.m_shared.m_canBeReparied || item.m_durability >= item.GetMaxDurability()) return false;
+        var recipe = ObjectDB.instance ? ObjectDB.instance.GetRecipe(item) : null;
+        if (recipe == null) return false;
+        bool named = (recipe.m_repairStation && recipe.m_repairStation.m_name == station.m_name) ||
+                     (recipe.m_craftingStation && recipe.m_craftingStation.m_name == station.m_name);
+        return named && Mathf.Min(station.GetLevel(), 4) >= recipe.m_minStationLevel;
+    }
+    // "craft 20 wood arrows" — splits an optional leading count off the item name.
+    static int SplitCount(ref string wanted, int cap = 20, int none = 1) {
+        int space = wanted.IndexOf(' ');
+        int count;
+        if (space <= 0 || !int.TryParse(wanted.Substring(0, space), out count) || count < 1) return none;
+        wanted = wanted.Substring(space + 1).Trim();
+        return Mathf.Min(count, cap);
+    }
+    bool Craft(string requested) {
+        var me = Player.m_localPlayer;
+        string wanted = Bare(requested);
+        if (wanted == null || !ObjectDB.instance) return false;
+        int asked = SplitCount(ref wanted);  // crafting caps at 20
+        // Upgrades and the one-ingredient recipes need a chosen item and quality,
+        // which only the crafting panel can supply; plain recipes are all I attempt.
+        var usable = ObjectDB.instance.m_recipes.Where(r =>
+            r && r.m_enabled && r.m_item && !r.m_noCraftOnlyUpgrade && !r.m_requireOnlyOneIngredient).ToList();
+        string key = Key(wanted);
+        var recipe = usable.FirstOrDefault(r => Key(RecipeName(r)) == key) ?? usable.FirstOrDefault(r => KeyMatches(RecipeName(r), key));
+        if (recipe == null) return false;
+        string name = Localization.instance.Localize(recipe.m_item.m_itemData.m_shared.m_name);
+        var station = recipe.GetRequiredStation(1);
+        if (station && me.GetCurrentCraftingStation() == null) { Say("I must stand at a " + Localization.instance.Localize(station.m_name) + " to make " + name + "."); return true; }
+        long crafter = Game.instance.GetPlayerProfile().GetPlayerID();
+        int made = 0;
+        bool full = false;
+        for (int i = 0; i < asked; i++) {
+            if (!me.HaveRequirements(recipe, false, 1)) break;
+            if (!me.GetInventory().CanAddItem(recipe.m_item.gameObject, recipe.m_amount)) { full = true; break; }
+            me.GetInventory().AddItem(recipe.m_item.gameObject.name, recipe.m_amount, 1, 0, crafter, me.GetPlayerName(), false);
+            me.ConsumeResources(recipe.m_resources, 1);
+            me.RaiseSkill(Skills.SkillType.Crafting);
+            made += recipe.m_amount;
+        }
+        if (made == 0) { Say(full ? "My pack is too full to make " + name + "." : "I lack what the " + name + " needs."); return true; }
+        Say("Made " + made + " " + name + (made < asked ? ", then ran short." : "."));
+        return true;
+    }
+    static string RecipeName(Recipe recipe) {
+        return Localization.instance.Localize(recipe.m_item.m_itemData.m_shared.m_name);
+    }
+    bool Emote(string word) {
+        string emote;
+        if (word == null || !emotes.TryGetValue(word.Trim(), out emote)) return false;
+        // Valheim cancels an emote the moment the character moves, so drop the job first.
+        Halt();
+        Player.m_localPlayer.StartEmote(emote, emote != "sit");
+        return true;
+    }
+
+    // ---- Collecting sweeps ----------------------------------------------
+
+    static IEnumerable<T> Nearby<T>(Vector3 origin, float radius) where T : Component {
+        return FindObjectsByType<T>(FindObjectsSortMode.None)
+            .Where(c => c && Vector3.Distance(c.transform.position, origin) <= radius);
+    }
+    static T Nearest<T>(Vector3 origin, float radius) where T : Component {
+        return Nearby<T>(origin, radius).OrderBy(c => Vector3.Distance(c.transform.position, origin)).FirstOrDefault();
+    }
+    static bool IsLive(Component part) {
+        var view = part ? part.GetComponent<ZNetView>() : null;
+        return view && view.IsValid();
+    }
+    // Scans take their centre, filter, and skip set as arguments so a sweep can be
+    // probed for targets before it cancels whatever the bot is already doing.
+    static bool Skipped(HashSet<int> skip, Component part) { return skip != null && skip.Contains(part.GetInstanceID()); }
+    ItemDrop NextDrop(Vector3 centre, string filter, HashSet<int> skip, Vector3 from) {
+        return Nearby<ItemDrop>(centre, SweepRadius)
+            .Where(d => !Skipped(skip, d) && !d.IsPiece() && IsLive(d) &&
+                        d.m_itemData?.m_shared != null && !NearAPile(piles, d.transform.position) &&
+                        (filter == null || NameMatches(d.m_itemData, filter)))
+            .OrderBy(d => Vector3.Distance(d.transform.position, from)).FirstOrDefault();
+    }
+    Pickable NextPickable(Vector3 centre, string filter, HashSet<int> skip, Vector3 from) {
+        return Nearby<Pickable>(centre, SweepRadius)
+            .Where(p => !Skipped(skip, p) && p.CanBePicked() && !p.GetPicked() &&
+                        (filter == null || KeyMatches(PickableName(p), Key(filter))))
+            .OrderBy(p => Vector3.Distance(p.transform.position, from)).FirstOrDefault();
+    }
+    // Standing trees and the trunks they leave behind are both worth an axe; rocks
+    // and ore veins both answer to a pickaxe.
+    IEnumerable<Component> Breakables(Job kind, Vector3 centre) {
+        if (kind == Job.Chop)
+            return Nearby<TreeBase>(centre, SweepRadius).Cast<Component>()
+                .Concat(Nearby<TreeLog>(centre, SweepRadius).Cast<Component>());
+        return Nearby<MineRock>(centre, SweepRadius).Cast<Component>()
+            .Concat(Nearby<MineRock5>(centre, SweepRadius).Cast<Component>());
+    }
+    Component NextBreakable(Job kind, Vector3 centre, HashSet<int> skip, Vector3 from) {
+        return Breakables(kind, centre)
+            .Where(c => !Skipped(skip, c) && IsLive(c))
+            .OrderBy(c => Vector3.Distance(c.transform.position, from)).FirstOrDefault();
+    }
+    // Valheim's own faction rules decide what counts as a foe, so tamed beasts and
+    // other vikings are never targets.
+    Character NextFoe(Vector3 centre, string filter, HashSet<int> skip, Vector3 from) {
+        var me = Player.m_localPlayer;
+        return Character.GetAllCharacters()
+            .Where(c => c && c != me && !c.IsDead() && !c.IsPlayer() && !c.IsTamed() && BaseAI.IsEnemy(me, c) &&
+                        !Skipped(skip, c) &&
+                        Vector3.Distance(c.transform.position, centre) <= SweepRadius &&
+                        (filter == null || KeyMatches(Localization.instance.Localize(c.m_name), Key(filter))))
+            .OrderBy(c => Vector3.Distance(c.transform.position, from)).FirstOrDefault();
+    }
+    // ---- Looking after himself -------------------------------------------
+
+    // Keeps his three food slots topped up from whatever he carries, best first.
+    // Valheim's own CanEat decides whether a slot is really free.
+    // "eat up" names nothing, so he picks the best thing he carries and says so.
+    bool EatBest() {
+        var player = Player.m_localPlayer;
+        var best = player.GetInventory().GetAllItems()
+            .Where(i => i.m_shared.m_food > 0f && player.CanEat(i, false))
+            .OrderByDescending(i => i.m_shared.m_food + i.m_shared.m_foodStamina)
+            .FirstOrDefault();
+        if (best == null) {
+            Say(player.GetFoods().Count >= 3 ? "I'm full as a jarl at Yule." : "I've nothing left to eat. Toss me something.");
+            return true;
+        }
+        string name = Localization.instance.Localize(best.m_shared.m_name);
+        Say(player.EatFood(best) ? "Aye. " + name + " it is." : "I cannot stomach the " + name + " yet.");
+        return true;
+    }
+    void Graze(Player player) {
+        if (Time.time < grazeCheck) return;
+        grazeCheck = Time.time + 8f;
+        var best = player.GetInventory().GetAllItems()
+            .Where(i => i.m_shared.m_food > 0f && player.CanEat(i, false))
+            .OrderByDescending(i => i.m_shared.m_food + i.m_shared.m_foodStamina)
+            .FirstOrDefault();
+        if (best == null) return;
+        string name = Localization.instance.Localize(best.m_shared.m_name);
+        if (player.EatFood(best)) Logger.LogInfo("Ate " + name + " to keep working.");
+    }
+
+    // Hungry, with nothing in the pack to fix it: food lying within a dozen paces is
+    // worth the walk, and otherwise he says so rather than quietly starving. Tossing
+    // him something is all it takes.
+    bool CarriesFood(Player player) {
+        return player.GetInventory().GetAllItems().Any(i => i.m_shared.m_food > 0f && player.CanEat(i, false));
+    }
+    bool Peckish(Player player) {
+        if (player.GetFoods().Count >= 3 || CarriesFood(player)) { morsel = null; return false; }
+        if (morsel && IsLive(morsel)) return true;
+        morsel = null;
+        if (Time.time < morselScan) return false;
+        morselScan = Time.time + 2f;
+        morsel = Nearby<ItemDrop>(player.transform.position, 12f)
+            .Where(d => IsLive(d) && !d.IsPiece() && d.m_itemData?.m_shared != null &&
+                        d.m_itemData.m_shared.m_food > 0f && player.CanEat(d.m_itemData, false))
+            .OrderBy(d => Vector3.Distance(d.transform.position, player.transform.position)).FirstOrDefault();
+        if (!morsel) { Beg(player); return false; }
+        morselAt = 0f;
+        return true;
+    }
+    // Rotating so he does not repeat himself, and getting less polite the longer he
+    // goes without. Cycling an index rather than drawing at random keeps it readable.
+    static readonly string[] begging = {
+        "My belly's empty. Toss me something and I'll keep swinging.",
+        "I could eat. Anything you can spare?",
+        "Working hungry is poor work. Have you food?",
+        "I'd trade an hour of chopping for a cooked meat right now.",
+        "Nothing in my pack but air. Food, if you have it.",
+    };
+    static readonly string[] starving = {
+        "Still nothing to eat. I'm starting to look at that boar differently.",
+        "A man cannot fell trees on an empty belly. Food. Please.",
+        "I have eaten nothing at all. Say the word and I'll go hunt something myself.",
+        "My strength is going. Anything. A mushroom. A berry. I am not proud.",
+    };
+    static readonly string[] thanks = {
+        "My thanks. That'll do nicely.",
+        "Ha! Good. That'll keep me swinging.",
+        "You're a good sort.",
+        "Aye, that's the stuff.",
+    };
+    void Beg(Player player) {
+        if (player.GetFoods().Count > 0) { hungrySince = 0f; return; }
+        if (hungrySince == 0f) hungrySince = Time.time;
+        // Nags sooner the longer he has gone without.
+        float wait = Time.time - hungrySince > 300f ? 60f : 120f;
+        if (Time.time - lastBeg < wait) return;
+        lastBeg = Time.time;
+        var lines = Time.time - hungrySince > 300f ? starving : begging;
+        Say(lines[begged++ % lines.Length]);
+    }
+    // Walk over to one dropped item and take it. Clears `which` once the errand is
+    // settled one way or another; returns true only on an actual pickup.
+    bool FetchDrop(Player player, ref ItemDrop which, ref float since) {
+        var step = StepToward(player, which.transform.position, 1.6f);
+        if (step != Step.Arrived) {
+            if (step != Step.Moving) { which = null; stuckTime = 0; }
+            return false;
+        }
+        // Only the ZDO owner may pick an item up, so ask and retry for a few seconds.
+        if (!which.CanPickup()) {
+            if (since == 0f) since = Time.time;
+            if (Time.time - since > 3f) which = null; else which.RequestOwn();
+            return false;
+        }
+        var drop = which;
+        which = null;
+        return player.Pickup(drop.gameObject, autoequip: false);
+    }
+    void TakeMorsel(Player player) {
+        if (!FetchDrop(player, ref morsel, ref morselAt)) return;
+        grazeCheck = 0f;   // Eat it on the next tick rather than waiting out the timer.
+        hungrySince = 0f;
+        Say(thanks[begged++ % thanks.Length]);
+    }
+
+    // ---- Carrying for you ------------------------------------------------
+
+    // While muling he shadows you and picks up anything you walk past, until he is
+    // loaded. He never grabs what he cannot fit.
+    bool Scavenging(Player player) {
+        if (job != Job.Mule || errand != Job.None || Loaded(player)) { salvage = null; return false; }
+        if (salvage && IsLive(salvage)) return true;
+        salvage = null;
+        if (Time.time < salvageScan) return false;
+        salvageScan = Time.time + 1f;
+        salvage = Nearby<ItemDrop>(player.transform.position, 12f)
+            .Where(d => IsLive(d) && !d.IsPiece() && d.m_itemData?.m_shared != null &&
+                        !NearAPile(piles, d.transform.position) &&
+                        player.GetInventory().CanAddItem(d.m_itemData))
+            .OrderBy(d => Vector3.Distance(d.transform.position, player.transform.position)).FirstOrDefault();
+        if (!salvage) return false;
+        salvageAt = 0f;
+        return true;
+    }
+    void Scavenge(Player player) {
+        if (FetchDrop(player, ref salvage, ref salvageAt)) muled++;
+    }
+    void Mule(Player speaker) {
+        Begin(Job.Mule);
+        target = speaker;
+        muled = 0; hauls = 0;
+        Say(places.ContainsKey("home")
+            ? "I'll walk with you and carry what you leave. When I'm full I'll run it home and come back."
+            : "I'll walk with you and carry what you leave. Say 'remember this as home' at a chest and I'll run full loads there.");
+    }
+    // "take it home" on demand, rather than waiting for the pack to fill.
+    bool HaulNow(Player speaker) {
+        var me = Player.m_localPlayer;
+        if ((IsSweep || job == Job.Mule) && errand == Job.None && StartHaul()) return true;
+        if (!places.TryGetValue("home", out var home)) {
+            Say("I know no home to take it to. Stand by a chest and say 'remember this as home'.");
+            return true;
+        }
+        Begin(Job.Haul);
+        destination = home;
+        // Come back to whoever asked once the pack is empty.
+        errand = Job.Come; target = speaker;
+        previous = me.transform.position;
+        Say("Taking it home.");
+        return true;
+    }
+
+    // ---- Bringing things to people ---------------------------------------
+
+    static readonly string[] minedThings = { "stone", "ore", "copper", "tin", "iron", "silver", "rock", "obsidian", "flametal" };
+    void StartDeliver(Player who, string owed) {
+        Begin(Job.Deliver);
+        target = who; deliverTo = who; deliverFilter = owed;
+        Say("Bringing you " + owed + ".");
+    }
+    void HandOver(Player player) {
+        string owed = deliverFilter;
+        if (owed != null && DropNamed(owed)) { Halt(); return; }
+        int dropped = 0;
+        foreach (var item in player.GetInventory().GetAllItems().ToList()) {
+            if (item.m_equipped) continue;
+            if (owed != null && !NameMatches(item, owed)) continue;
+            if (player.DropItem(player.GetInventory(), item, item.m_stack)) dropped++;
+        }
+        Halt(dropped == 0
+            ? "I came back with no " + owed + " to give you."
+            : "There — " + dropped + (dropped == 1 ? " stack" : " stacks") + " of " + owed + " for you.");
+    }
+    // "bring me some wood": hand it over if he has it, otherwise go and get some
+    // first. The delivery is remembered across the gathering job and runs when it ends.
+    bool Bring(Player speaker, string requested) {
+        var me = Player.m_localPlayer;
+        string asked = Bare(requested);
+        if (asked == null || !speaker) return false;
+        // Split any leading count off before matching: "10 wood" must still find wood.
+        // The count is carried through to the hand-over so he gives you what you asked.
+        string filter = asked;
+        int count = SplitCount(ref filter, cap: 9999, none: 0);
+        if (filter.Length == 0) return false;
+        string owed = count == 0 ? filter : count + " " + filter;
+        if (FindItem(filter, false, false) != null) { StartDeliver(speaker, owed); return true; }
+        Vector3 here = me.transform.position;
+        string key = Key(filter);
+        bool started;
+        if (Probe(Job.Fetch, here, filter, null, here) != null) started = Fetch(filter);
+        else if (key.Contains("wood") || key.Contains("log") || key.Contains("timber")) { Chop(); started = job == Job.Chop; }
+        else if (minedThings.Any(m => key.Contains(m))) { Mine(); started = job == Job.Mine; }
+        else if (Probe(Job.Harvest, here, filter, null, here) != null) started = Harvest(filter);
+        else return false;
+        if (!started) return false;
+        deliverTo = speaker; deliverFilter = owed;
+        return true;
+    }
+
+    // ---- Dying and getting the gear back ---------------------------------
+
+    internal void Struck(HitData hit) {
+        if (!Active) return;
+        var attacker = hit.GetAttacker();
+        if (!attacker || attacker == Player.m_localPlayer || attacker.IsPlayer() || attacker.IsTamed()) return;
+        hurtBy = attacker;
+        hurtAt = Time.time;
+    }
+    internal void RememberGrave(Vector3 where) {
+        graveSpot = where; graveKnown = true;
+        Logger.LogInfo("Died at " + Vector3ToConfig(where) + "; will try to recover the grave.");
+    }
+    internal void AfterRespawn() {
+        if (!graveKnown || !Active) return;
+        Begin(Job.Grave);
+        destination = graveSpot;
+        Say("I fell. I'm going back for my gear.");
+    }
+    void AtGrave(Player player) {
+        var stone = Nearest<TombStone>(player.transform.position, 8f);
+        var box = stone ? stone.GetComponent<Container>() : null;
+        var view = stone ? stone.GetComponent<ZNetView>() : null;
+        if (!box || !view || !view.IsValid()) { graveKnown = false; Halt("I came to where I fell, but my grave is not here."); return; }
+        // Moving the items across directly rather than calling Interact, because the
+        // vanilla path opens the inventory window when the load will not all fit.
+        view.ClaimOwnership();
+        var from = box.GetInventory();
+        int taken = 0;
+        foreach (var item in from.GetAllItems().ToList()) {
+            if (!player.GetInventory().CanAddItem(item) || !player.GetInventory().AddItem(item)) continue;
+            from.RemoveItem(item);
+            taken++;
+        }
+        graveKnown = false;
+        int left = from.GetAllItems().Count;
+        if (taken == 0) { Halt("My grave is here, but I cannot carry what is in it."); return; }
+        GearUp(player);
+        Say("I have my gear back" + (left > 0 ? ", though " + left + " stacks stay behind." : ".") + (places.ContainsKey("home") ? " Heading home." : ""));
+        if (places.ContainsKey("home")) GoToPlace("home"); else Halt();
+    }
+
+    // ---- Guard duty ------------------------------------------------------
+
+    static readonly ItemDrop.ItemData.ItemType[] armourSlots = {
+        ItemDrop.ItemData.ItemType.Helmet, ItemDrop.ItemData.ItemType.Chest,
+        ItemDrop.ItemData.ItemType.Legs, ItemDrop.ItemData.ItemType.Shoulder,
+        ItemDrop.ItemData.ItemType.Shield,
+    };
+    // Put on the best of everything he carries. EquipItem sorts out conflicts such as
+    // a two-handed weapon refusing a shield.
+    void GearUp(Player player) {
+        WieldWeapon(player);
+        var carried = player.GetInventory().GetAllItems();
+        foreach (var slot in armourSlots) {
+            var best = carried.Where(i => i.m_shared.m_itemType == slot && i.IsEquipable())
+                .OrderByDescending(i => i.GetArmor()).ThenByDescending(i => i.m_quality).FirstOrDefault();
+            if (best != null && !best.m_equipped) player.EquipItem(best);
+        }
+    }
+    // Walk a ring that hugs whatever has actually been built here, so the patrol
+    // follows the camp rather than an arbitrary circle.
+    float CampRadius(Vector3 centre) {
+        var built = Nearby<Piece>(centre, GuardSpan).ToList();
+        if (built.Count == 0) return 8f;
+        float far = built.Max(b => Vector3.Distance(b.transform.position, centre));
+        return Mathf.Clamp(far + 3f, 6f, GuardSpan);
+    }
+    void NextPost() {
+        patrolStep = (patrolStep + 1) % 8;
+        float angle = patrolStep * 45f * Mathf.Deg2Rad;
+        destination = anchor + new Vector3(Mathf.Sin(angle), 0f, Mathf.Cos(angle)) * patrolRing;
+    }
+    bool Guard(string raw) {
+        var me = Player.m_localPlayer;
+        Vector3 centre;
+        string name;
+        if (raw == null) {
+            // No place named: guard home if he has one, otherwise right where he stands.
+            if (places.TryGetValue("home", out centre)) name = "home";
+            else { centre = me.transform.position; name = "this ground"; }
+        } else {
+            name = PlaceName(raw);
+            if (name == null || !places.TryGetValue(name, out centre)) return false;
+        }
+        Begin(Job.Patrol);
+        anchor = centre;
+        patrolRing = CampRadius(centre);
+        patrolStep = 0;
+        NextPost();
+        GearUp(me);
+        var weapon = me.GetCurrentWeapon();
+        Say(weapon == null
+            ? "I'll watch " + name + ", though I have no weapon to hand."
+            : "I'll walk the bounds of " + name + " with my " + Localization.instance.Localize(weapon.m_shared.m_name) + " and keep it clear.");
+        return true;
+    }
+    bool WieldWeapon(Player player) {
+        var held = player.GetCurrentWeapon();
+        if (held != null && held.IsWeapon()) return true;
+        var best = player.GetInventory().GetAllItems()
+            .Where(i => i.IsWeapon() && i.IsEquipable())
+            .OrderByDescending(i => i.GetDamage().GetTotalDamage()).FirstOrDefault();
+        if (best == null) return false;
+        player.EquipItem(best);
+        return true;
+    }
+    // Walk to the nearest point on the target's own collider rather than its pivot.
+    // A felled log is metres long: aiming at its centre put him far outside his own
+    // swing, so the axe never connected.
+    static Vector3 Edge(Component what, Vector3 from) {
+        foreach (var collider in what.GetComponentsInChildren<Collider>()) {
+            if (!collider || !collider.enabled || collider.isTrigger) continue;
+            var mesh = collider as MeshCollider;
+            if (mesh != null && !mesh.convex) continue;  // ClosestPoint is undefined on these.
+            return collider.ClosestPoint(from);
+        }
+        return what.transform.position;
+    }
+    static float Reach(Player player, Component what) {
+        var weapon = player.GetCurrentWeapon();
+        float swing = weapon?.m_shared?.m_attack != null ? weapon.m_shared.m_attack.m_attackRange : 2f;
+        return Mathf.Clamp(swing, 1.6f, 2.8f);
+    }
+    // Picks up (or keeps) the best tool of a kind. Returns false when there is none.
+    bool Wield(Player player, Skills.SkillType kind) {
+        var held = player.GetCurrentWeapon();
+        if (held != null && held.m_shared.m_skillType == kind) return true;
+        var tool = player.GetInventory().GetAllItems()
+            .Where(i => i.m_shared.m_skillType == kind && i.IsEquipable())
+            .OrderByDescending(i => i.m_shared.m_toolTier).ThenByDescending(i => i.m_quality).FirstOrDefault();
+        if (tool == null) return false;
+        player.EquipItem(tool);
+        return true;
+    }
+    // Face the target and swing on the weapon's own cadence. Leaves a little stamina
+    // so Valheim's exhaustion never strands him mid-fight.
+    void SwingAt(Player player, Component what) {
+        Vector3 aim = Edge(what, player.transform.position) - player.transform.position;
+        if (aim.sqrMagnitude > 0.0001f) { player.SetLookDir(aim.normalized); player.FaceLookDirection(); }
+        if (Time.time < swingUntil || player.GetStamina() < 10f) return;
+        if (player.StartAttack(null, false)) swingUntil = Time.time + 0.4f;
+    }
+    void Swing(Player player) {
+        if (reachedAt == 0f) reachedAt = Time.time;
+        if (Time.time - reachedAt > TargetSeconds) { Skip(); return; }
+        SwingAt(player, sweepTarget);
+    }
+    void Skip() {
+        if (sweepTarget) visited.Add(sweepTarget.GetInstanceID());
+        sweepTarget = null; reachedAt = 0f; stuckTime = 0;
+    }
+    // A Pickable without an item prefab throws inside GetHoverName; treat it as unnamed.
+    static string PickableName(Pickable pickable) {
+        try { return Localization.instance.Localize(pickable.GetHoverName()); }
+        catch { return ""; }
+    }
+    // Every sweep has the same shape: probe for a target from where the bot stands,
+    // and only cancel the current job once one is found. A named target that is not
+    // there returns false so the caller can hand the sentence to the planner instead.
+    bool Sweep(Job kind, string requested, string empty, string starting) {
+        Vector3 here = Player.m_localPlayer.transform.position;
+        string filter = Bare(requested);
+        if (Probe(kind, here, filter, null, here) == null) {
+            if (filter != null) return false;
+            Say(empty);
+            return true;
+        }
+        Begin(kind);
+        anchor = here; sweepFilter = filter;
+        collected = 0; hauls = 0; sweepUntil = Time.time + SweepSeconds; reachedAt = 0f;
+        Say(starting);
+        return true;
+    }
+    // Which tool a working job leans on. Fighting is left out on purpose: breaking
+    // off mid-fight to mend a sword is how a companion gets killed.
+    static Skills.SkillType ToolFor(Job kind) {
+        if (kind == Job.Chop) return Skills.SkillType.Axes;
+        if (kind == Job.Mine) return Skills.SkillType.Pickaxes;
+        return Skills.SkillType.None;
+    }
+    // True when the wielded tool of that kind is nearly spent and worth mending.
+    bool Blunt(Skills.SkillType kind) {
+        if (kind == Skills.SkillType.None) return false;
+        var tool = Player.m_localPlayer.GetCurrentWeapon();
+        if (tool == null || tool.m_shared.m_skillType != kind) return false;
+        if (!tool.m_shared.m_useDurability || !tool.m_shared.m_canBeReparied) return false;
+        float max = tool.GetMaxDurability();
+        return max > 0f && tool.m_durability / max <= 0.15f;
+    }
+    // Break off to mend, then come back to the same spot and carry on. Uses the same
+    // errand slot as hauling, so only one detour is ever in flight.
+    bool StartMend(Skills.SkillType kind) {
+        if (errand != Job.None || !IsSweep) return false;
+        var me = Player.m_localPlayer;
+        var tool = me.GetCurrentWeapon();
+        string name = tool != null ? Localization.instance.Localize(tool.m_shared.m_name) : "tool";
+        Vector3 where;
+        // A station he is already standing at beats any walk.
+        if (me.GetCurrentCraftingStation() != null) where = me.transform.position;
+        else if (!places.TryGetValue("workbench", out where) && !places.TryGetValue("home", out where)) {
+            Say("My " + name + " is nearly spent and I know no place to mend it. Say 'remember this as workbench' at one.");
+            return false;
+        }
+        errand = job;
+        job = Job.Mend;
+        destination = where;
+        sweepTarget = null; reachedAt = 0f; stuckTime = 0;
+        previous = me.transform.position;
+        Say("My " + name + " is nearly spent. I'll mend it and come back.");
+        return true;
+    }
+    void Mend(Player player) {
+        if (player.GetCurrentCraftingStation() != null) { Repair(); ResumeSweep(player); return; }
+        var station = Nearest<CraftingStation>(player.transform.position, 15f);
+        if (station && Vector3.Distance(station.transform.position, player.transform.position) > 1.8f) {
+            destination = station.transform.position; reachedAt = 0f;
+            return;
+        }
+        // Valheim registers the station from its own update, so allow a moment before
+        // giving up rather than standing there forever.
+        if (reachedAt == 0f) reachedAt = Time.time;
+        if (Time.time - reachedAt > 8f)
+            Halt(station ? "I stand at the station but it will not serve me." : "I came to mend, but there is no station here.");
+    }
+    void ResumeSweep(Player player) {
+        job = Job.Resume; reachedAt = 0f; stuckTime = 0; previous = player.transform.position;
+    }
+    // A full pack pauses the sweep rather than ending it: run the load to the home
+    // chest, then walk back to the anchor and carry on. Deliberately does not go
+    // through Halt, which would forget the anchor, filter and skip list.
+    // Valheim's own pickup gives up on weight well before the last slot fills, so a
+    // haul has to trigger on either.
+    static bool Loaded(Player player) {
+        return !player.GetInventory().HaveEmptySlot() ||
+               player.GetInventory().GetTotalWeight() >= player.GetMaxCarryWeight() * 0.9f;
+    }
+    bool StartHaul() {
+        if (errand != Job.None || (!IsSweep && job != Job.Mule)) return false;
+        if (!places.TryGetValue("home", out var home)) return false;
+        errand = job;
+        job = Job.Haul;
+        destination = home;
+        sweepTarget = null; reachedAt = 0f; stuckTime = 0;
+        previous = Player.m_localPlayer.transform.position;
+        Say("My pack is full. I'll run this home and come back for the rest.");
+        return true;
+    }
+    Component Probe(Job kind, Vector3 centre, string filter, HashSet<int> skip, Vector3 from) {
+        switch (kind) {
+            case Job.Fetch: return NextDrop(centre, filter, skip, from);
+            case Job.Harvest: return NextPickable(centre, filter, skip, from);
+            case Job.Fight: return NextFoe(centre, filter, skip, from);
+            default: return NextBreakable(kind, centre, skip, from);
+        }
+    }
+    bool Fetch(string requested) {
+        string filter = Bare(requested);
+        return Sweep(Job.Fetch, requested,
+            "Nothing lies on the ground near here.",
+            filter == null ? "I'll gather what has fallen." : "I'll gather the " + filter + ".");
+    }
+    bool Harvest(string requested) {
+        string filter = Bare(requested);
+        return Sweep(Job.Harvest, requested,
+            "There is nothing to forage near here.",
+            filter == null ? "I'll pick what grows here." : "I'll pick the " + filter + ".");
+    }
+    void Chop() {
+        if (!Wield(Player.m_localPlayer, Skills.SkillType.Axes)) { Say("I have no axe to swing."); return; }
+        Sweep(Job.Chop, null, "No trees stand close enough to fell.", "I'll put the axe to these trees.");
+    }
+    void Mine() {
+        if (!Wield(Player.m_localPlayer, Skills.SkillType.Pickaxes)) { Say("I have no pickaxe to swing."); return; }
+        Sweep(Job.Mine, null, "There is no rock near here worth breaking.", "I'll break what rock I can reach.");
+    }
+    bool Fight(string requested) {
+        var me = Player.m_localPlayer;
+        string filter = Bare(requested);
+        Vector3 here = me.transform.position;
+        // Check there is really something to fight before drawing a weapon, so
+        // "kill some time" leaves him holding whatever he already had.
+        if (NextFoe(here, filter, null, here) == null) {
+            if (filter != null) return false;
+            Say("Nothing hostile stirs near me.");
+            return true;
+        }
+        if (!WieldWeapon(me)) { Say("I have no weapon to raise."); return true; }
+        return Sweep(Job.Fight, requested,
+            "Nothing hostile stirs near me.",
+            filter == null ? "Stand back. I'll meet them." : "I'll go for the " + filter + ".");
+    }
+    // Turns a finished chop or mine into a gather over the same ground, keeping the
+    // tally so the final report covers the whole job.
+    void GleanOrFinish(string why) {
+        var felling = job;
+        string done = felling == Job.Chop ? "I felled " + collected + "." : "I broke " + collected + ".";
+        if (collected == 0) { FinishSweep(why); return; }
+        var player = Player.m_localPlayer;
+        visited.Clear();
+        sweepFilter = null;
+        job = Job.Fetch;
+        sweepTarget = null; reachedAt = 0f; stuckTime = 0;
+        sweepUntil = Time.time + SweepSeconds;
+        if (NextDrop(anchor, null, visited, player.transform.position) == null) {
+            job = felling;  // Nothing to glean: report the felling, not a gather.
+            FinishSweep(why);
+            return;
+        }
+        collected = 0;
+        Say(done + " " + why + " Now to gather it up.");
+    }
+    void FinishSweep(string why) {
+        string what;
+        switch (job) {
+            case Job.Harvest: what = "picked"; break;
+            case Job.Chop: what = "felled"; break;
+            case Job.Mine: what = "broke"; break;
+            case Job.Fight: what = "put down"; break;
+            default: what = "gathered"; break;
+        }
+        string trips = hauls == 0 ? "" : " Carried " + hauls + (hauls == 1 ? " load" : " loads") + " home.";
+        var owed = deliverTo; string owedWhat = deliverFilter;
+        Halt(collected == 0 ? "I " + what + " nothing. " + why + trips : "I " + what + " " + collected + ". " + why + trips);
+        if (owed) StartDeliver(owed, owedWhat);
+    }
+
+    // ---- Steering --------------------------------------------------------
+
+    // One line per group of Receive's dispatch below. Each stays under the 180
+    // characters Say will cut at, so nothing goes missing mid-sentence.
+    void Help() {
+        Say("I follow, come here, stay, and walk to any place I know. Say 'remember this as home', or name one: 'remember this as the mine', then 'go to the mine'.");
+        Say("Ask me for inventory, status, where I am, or what I see nearby.");
+        Say("Set me to work: gather, harvest, chop, mine. I keep at it, run full loads home to the chest, mend a blunt axe, and come back to it until the ground is bare.");
+        Say("Say 'bring me some wood' and I'll fetch it and put it in your hands. Say 'guard the camp' and I'll arm myself and walk the bounds.");
+        Say("I fight back on my own, eat when I need to, and go back for my gear when I fall.");
+        Say("Also: deposit, take all, craft, repair, eat, equip, unequip, drop, open the door, feed the fire — and emotes like wave and dance.");
+    }
+    IEnumerator Decide(string order, Player speaker, int version) {
+        string token;
+        try { token = File.ReadAllText(tokenFile.Value).Trim(); }
+        catch { Say("My thoughts are quiet. I can still follow, stay, or report inventory."); yield break; }
+        busy = true;
+        Say("Give me a moment to think on that.");
+        var me = Player.m_localPlayer;
+        var payload = JsonConvert.SerializeObject(new { message = order, state = new {
+            health = me.GetHealth(), maxHealth = me.GetMaxHealth(),
+            stamina = me.GetStamina(), maxStamina = me.GetMaxStamina(),
+            task = job.ToString().ToLowerInvariant(),
+            biome = Heightmap.FindBiome(me.transform.position).ToString(),
+            haveBed = TryParsePosition(bedPosition.Value, out _),
+            places = places.Keys.ToArray(),
+            chestNearby = Nearest<Container>(me.transform.position, 5f) != null,
+            stationNearby = me.GetCurrentCraftingStation() != null,
+            inventory = me.GetInventory().GetAllItems().Take(40).Select(i => new { name = Localization.instance.Localize(i.m_shared.m_name), count = i.m_stack })
+        }});
+        using (var request = new UnityWebRequest("http://127.0.0.1:8765/decide", "POST")) {
+            pendingRequest = request;
+            request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(payload));
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Content-Type", "application/json");
+            request.SetRequestHeader("Authorization", "Bearer " + token);
+            request.timeout = 15;
+            yield return request.SendWebRequest();
+            pendingRequest = null;
+            busy = false;
+            if (version != generation || !Active || Player.m_localPlayer != me || !speaker) yield break;
+            if (request.result != UnityWebRequest.Result.Success) { Say("My thoughts falter. Speak a simple order."); yield break; }
+            Decision decision = null;
+            try { decision = JsonConvert.DeserializeObject<Decision>(request.downloadHandler.text); } catch { }
+            if (decision == null) yield break;
+            // A blank item means "everything" for the sweeps but is a real argument for
+            // eat and equip, where the reply is the planner's usual fallback slot.
+            string item = Normalize(decision.item);
+            switch (decision.action) {
+                case "follow": Follow(speaker); break;
+                case "come": Come(speaker); break;
+                case "escort": Escort(speaker); break;
+                case "mule": Mule(speaker); break;
+                case "haul": HaulNow(speaker); break;
+                case "stay": Halt("I'll hold here."); break;
+                case "inventory": Inventory(); break;
+                case "status": Status(); break;
+                case "where": Where(); break;
+                case "scan": Scan(); break;
+                case "self_test": SelfTest(); break;
+                case "remember_home": RememberPlace(item ?? "home"); break;
+                case "go_home": if (item == null) GoHome(); else if (!GoToPlace(item)) Say("I know no place called that."); break;
+                case "places": ListPlaces(); break;
+                case "claim_bed": ClaimNearbyBed(); break;
+                case "go_to_bed": GoToBed(); break;
+                case "eat": if (item == null) EatBest(); else if (!EatNamed(item)) Say("I have no food by that name."); break;
+                case "equip": if (!EquipNamed(item ?? decision.reply)) Say("I have nothing like that to equip."); break;
+                case "unequip": if (item == null) UnequipAll(); else if (!UnequipNamed(item)) Say("I have nothing like that equipped."); break;
+                case "drop": if (!DropNamed(item ?? decision.reply)) Say("I carry nothing by that name."); break;
+                case "bring": if (!Bring(speaker, item ?? decision.reply)) Say("I cannot find any " + (item ?? "of that") + " to bring you."); break;
+                case "gather": if (!Fetch(item)) Say("I see no " + item + " on the ground."); break;
+                case "harvest": if (!Harvest(item)) Say("I find no " + item + " growing here."); break;
+                case "chop": Chop(); break;
+                case "mine": Mine(); break;
+                case "fight": if (!Fight(item)) Say("I see no " + item + " to fight."); break;
+                case "guard": if (!Guard(item)) Say("I know no place called that to guard."); break;
+                case "deposit": if (!Deposit(item)) Say("I have no " + item + " to put away."); break;
+                case "withdraw": if (!Withdraw(item)) Say("I find no " + item + " to take."); break;
+                case "drop_all": DropAll(); break;
+                case "pile": {
+                    int piled = Pile(me);
+                    Say(piled == 0 ? "I've nothing worth piling up." : "Piled " + piled + " here. My gear stays with me.");
+                    break;
+                }
+                case "craft": if (!Craft(item ?? decision.reply)) Say("I know no recipe for that."); break;
+                case "repair": Repair(); break;
+                case "feed_fire": FeedFire(); break;
+                case "open_door": UseDoor(true); break;
+                case "close_door": UseDoor(false); break;
+                case "emote": if (!Emote(item)) Say(decision.reply); break;
+                case "chat": Say(decision.reply); break;
+            }
+        }
+    }
+    class Decision { public string action; public string reply; public string item; }
+    // Picks the point to walk toward for the running job, retargeting a sweep when
+    // its current target is gone. Returns false once the job has finished or failed.
+    bool NextGoal(Player player, out Vector3 goal, out float arrival) {
+        goal = player.transform.position; arrival = 3f;
+        switch (job) {
+            case Job.Follow:
+            case Job.Come:
+            case Job.Escort:
+            case Job.Mule:
+                if (!target) { Halt("I have lost you."); return false; }
+                goal = target.transform.position;
+                arrival = job == Job.Follow || job == Job.Come ? 3f : 4f;
+                return true;
+            case Job.Home:
+            case Job.Bed:
+            case Job.Haul:
+                goal = destination;
+                return true;
+            case Job.Resume:
+                // A mule run ends back at whoever he is carrying for, not at a spot.
+                if ((errand == Job.Mule || errand == Job.Come) && target) { goal = target.transform.position; arrival = 4f; }
+                else goal = anchor;
+                return true;
+            case Job.Patrol:
+                goal = destination; arrival = 2.5f;
+                return true;
+            case Job.Grave:
+                goal = destination;
+                return true;
+            case Job.Deliver:
+                if (!target) { Halt("I have what you asked for, but I have lost you."); return false; }
+                goal = target.transform.position; arrival = 2.5f;
+                return true;
+            case Job.Fetch:
+                if (!sweepTarget || !IsLive(sweepTarget)) {
+                    sweepTarget = NextDrop(anchor, sweepFilter, visited, player.transform.position);
+                    reachedAt = 0f;
+                    if (!sweepTarget) { FinishSweep("Nothing more lies about."); return false; }
+                }
+                goal = sweepTarget.transform.position; arrival = 1.6f;
+                return true;
+            case Job.Harvest:
+                var pickable = sweepTarget as Pickable;
+                if (!pickable || pickable.GetPicked()) {
+                    sweepTarget = NextPickable(anchor, sweepFilter, visited, player.transform.position);
+                    reachedAt = 0f;
+                    if (!sweepTarget) { FinishSweep("Nothing more grows within reach."); return false; }
+                }
+                goal = sweepTarget.transform.position; arrival = 3.5f;
+                return true;
+            case Job.Chop:
+            case Job.Mine:
+                if (!sweepTarget) {
+                    // Valheim destroys a tree or rock outright when it breaks, so a
+                    // target that vanishes after we reached it is one we finished.
+                    if (reachedAt != 0f) collected++;
+                    reachedAt = 0f;
+                    sweepTarget = NextBreakable(job, anchor, visited, player.transform.position);
+                    // Felling scatters the wood well outside Valheim's 2 m pickup, so
+                    // the job is not done until he has swept up what he knocked down.
+                    if (!sweepTarget) { GleanOrFinish(job == Job.Chop ? "No tree is left standing here." : "No rock is left to break here."); return false; }
+                }
+                goal = Edge(sweepTarget, player.transform.position); arrival = Reach(player, sweepTarget);
+                return true;
+            case Job.Fight:
+                var foe = sweepTarget as Character;
+                if (!foe || foe.IsDead()) {
+                    if (foe && foe.IsDead()) collected++;
+                    reachedAt = 0f;
+                    sweepTarget = NextFoe(anchor, sweepFilter, visited, player.transform.position);
+                    if (!sweepTarget) { FinishSweep("The ground is quiet again."); return false; }
+                }
+                goal = Edge(sweepTarget, player.transform.position); arrival = Reach(player, sweepTarget);
+                return true;
+            default:
+                return false;
+        }
+    }
+    void Arrive(Player player) {
+        switch (job) {
+            case Job.Follow:
+            case Job.Escort:
+            case Job.Mule: stuckTime = 0; break;
+            case Job.Come: Halt("I'm here."); break;
+            case Job.Home: Halt("I’m home."); break;
+            case Job.Bed:
+                if (bed) bed.Interact(player, false, false);
+                Halt("I’ve reached the bed. The bed will decide if sleep is possible.");
+                break;
+            case Job.Patrol: NextPost(); break;
+            case Job.Grave: AtGrave(player); break;
+            case Job.Deliver: HandOver(player); break;
+            case Job.Mend: Mend(player); break;
+            case Job.Haul: Unload(player); break;
+            case Job.Resume:
+                var back = errand;
+                errand = Job.None;
+                sweepTarget = null; reachedAt = 0f; stuckTime = 0;
+                sweepUntil = Time.time + SweepSeconds; // Each load gets a fresh clock.
+                if (back == Job.Come) { Halt("Unloaded, and back with you."); break; }
+                job = back;
+                Say(back == Job.Mule ? "Back with you. Load me up." : "Back to it.");
+                break;
+            case Job.Fetch: TakeDrop(player); break;
+            case Job.Harvest:
+                var pickable = (Pickable)sweepTarget;
+                visited.Add(pickable.GetInstanceID());
+                sweepTarget = null;
+                if (pickable.Interact(player, false, false)) collected++;
+                break;
+            case Job.Chop:
+            case Job.Mine:
+            case Job.Fight:
+                Swing(player);
+                break;
+        }
+    }
+    // He is standing at the chest anyway: take a few meals if he has none on him.
+    int Restock(Player player, Container chest) {
+        if (!chest || CarriesFood(player)) return 0;
+        var from = chest.GetInventory();
+        int taken = 0;
+        foreach (var item in from.GetAllItems().ToList()) {
+            if (taken >= 3) break;
+            if (item.m_shared.m_food <= 0f) continue;
+            if (!player.GetInventory().CanAddItem(item) || !player.GetInventory().AddItem(item)) continue;
+            from.RemoveItem(item);
+            taken++;
+        }
+        if (taken > 0) grazeCheck = 0f;
+        return taken;
+    }
+    // Drops the haul-worthy part of the pack on the ground and keeps his kit. Items
+    // dropped in Valheim persist, so a pile at home is a slower chest, not a loss.
+    int Pile(Player player) {
+        int dropped = 0;
+        foreach (var item in player.GetInventory().GetAllItems().ToList()) {
+            if (item.m_equipped || !Spare(item)) continue;
+            if (player.DropItem(player.GetInventory(), item, item.m_stack)) dropped++;
+        }
+        if (dropped > 0) piles.Add(player.transform.position);
+        return dropped;
+    }
+    static bool NearAPile(List<Vector3> spots, Vector3 where) {
+        foreach (var spot in spots) if (Vector3.Distance(spot, where) < 5f) return true;
+        return false;
+    }
+    void Unload(Player player) {
+        // A base is usually a row of chests, not one. Work along them nearest first
+        // so a single full chest never stalls the run.
+        var chests = Nearby<Container>(player.transform.position, 8f)
+            .OrderBy(c => Vector3.Distance(c.transform.position, player.transform.position)).Take(8).ToList();
+        int moved = 0;
+        foreach (var chest in chests) {
+            bool full;
+            moved += MoveInto(chest, null, true, out full);
+        }
+        // Chests missing or all full must not end the job: leave the rest on the
+        // ground at home and carry on, rather than standing there holding it.
+        int piled = Loaded(player) && pileOver.Value ? Pile(player) : 0;
+        if (moved == 0 && piled == 0) {
+            Halt(chests.Count == 0
+                ? "I'm home with a full pack, but there's no chest here and you've told me not to pile it up."
+                : "The chests at home are full and I'm told not to pile the rest up.");
+            return;
+        }
+        hauls++;
+        int grabbed = 0;
+        foreach (var chest in chests) { grabbed = Restock(player, chest); if (grabbed > 0) break; }
+        string what = moved > 0 && piled > 0
+                ? "Chests took " + moved + ", the rest is piled beside them."
+            : moved > 0
+                ? "Unloaded " + moved + (moved == 1 ? " stack" : " stacks") + " into " + chests.Count + (chests.Count == 1 ? " chest." : " chests.")
+            : (chests.Count == 0 ? "No chest here — piled " : "Chests are full — piled ") + piled + " on the ground.";
+        Say(what + (grabbed > 0 ? " Took food for the road." : "") + " Going back for more.");
+        job = Job.Resume; reachedAt = 0f; stuckTime = 0;
+        previous = player.transform.position;
+    }
+    void TakeDrop(Player player) {
+        var drop = (ItemDrop)sweepTarget;
+        // Only the ZDO owner may pick an item up, so ask first and try again next tick.
+        if (!drop.CanPickup()) {
+            if (reachedAt == 0f) reachedAt = Time.time;
+            if (Time.time - reachedAt > 3f) Skip();
+            else drop.RequestOwn();
+            return;
+        }
+        Skip();
+        if (player.Pickup(drop.gameObject, autoequip: false)) collected++;
+        else if (Loaded(player) && !StartHaul()) FinishSweep("My pack has no room left.");
+    }
+    // One tick of walking toward a point. Every job and the fight overlay share it,
+    // so steering, jumping, sprinting and stuck detection behave the same everywhere.
+    Step StepToward(Player player, Vector3 goal, float arrival) {
+        Vector3 delta = goal - player.transform.position;
+        delta.y = 0;
+        if (delta.magnitude < arrival) return Step.Arrived;
+        var direction = SelectWalkDirection(player.transform.position, delta.normalized);
+        if (direction == Vector3.zero) return Step.Blocked;
+        direction.y = 0;
+        direction.Normalize();
+        int mask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain");
+        bool jump = Time.time >= jumpUntil && CanJumpForward(player.transform.position, direction, mask);
+        if (jump) jumpUntil = Time.time + 1.2f;
+        if (Vector3.Distance(previous, player.transform.position) < 0.01f) stuckTime += Time.fixedDeltaTime; else stuckTime = 0;
+        previous = player.transform.position;
+        if (stuckTime > 3) return Step.Stuck;
+        // Feed the real player controller so sprint and jump are handled like
+        // ordinary input instead of only changing the replicated move vector.
+        bool sprint = delta.magnitude > 6f && player.GetStamina() > player.GetMaxStamina() * 0.2f;
+        player.SetControls(direction, false, false, false, false, false, false, jump, false, sprint, false);
+        move.SetValue(player, direction);
+        return Step.Moving;
+    }
+
+    // ---- Fighting back ---------------------------------------------------
+
+    // A fight is an overlay, not a job: it interrupts whatever he was doing and the
+    // job resumes untouched the moment the ground is clear.
+    bool Threatened(Player player) {
+        bool guarding = job == Job.Patrol;
+        bool escorting = job == Job.Escort && target;
+        if (!guarding && !escorting && (!defendSelf.Value || job == Job.Fight)) { threat = null; return false; }
+        // Badly hurt, he breaks off rather than trading blows he cannot win. While
+        // escorting that means falling back to you and healing up, not standing still.
+        if (player.GetHealth() < player.GetMaxHealth() * 0.35f || player.IsSwimming()) { threat = null; return false; }
+        // Something that actually hit him outranks anything merely standing nearby:
+        // an archer at thirty paces would otherwise be ignored entirely.
+        if (hurtBy && !hurtBy.IsDead() && Time.time - hurtAt < 15f && threat != hurtBy) {
+            // Focus fire. While he is on a boss for you, adds do not get to pull him
+            // off it - that is the whole point of being asked along on the hunt.
+            bool lockedOn = escorting && threat && !threat.IsDead() && threat.IsBoss();
+            if (!lockedOn && WieldWeapon(player)) {
+                threat = hurtBy;
+                fightFrom = player.transform.position;
+                stuckTime = 0;
+                if (Time.time - lastShout > 10f) {
+                    lastShout = Time.time;
+                    Say("Right — that one wants a fight. " + Localization.instance.Localize(hurtBy.m_name) + ".");
+                }
+                return true;
+            }
+        }
+        // Keep the current foe while it lives and stays inside the leash.
+        Vector3 leashFrom = guarding ? anchor : (escorting ? target.transform.position : fightFrom);
+        float leash = guarding ? GuardSpan * 1.3f : (escorting ? 30f : 20f);
+        if (threat && !threat.IsDead() && Vector3.Distance(threat.transform.position, leashFrom) <= leash) return true;
+        threat = null;
+        if (Time.time < threatScan) return false;
+        threatScan = Time.time + 0.4f;
+        // Escorting, he watches around YOU, not himself, so he goes for what the party
+        // is fighting rather than whatever happens to be nearest him. On guard duty he
+        // watches the whole camp. Otherwise he only answers what comes near him.
+        Vector3 watchFrom = guarding ? anchor : (escorting ? target.transform.position : player.transform.position);
+        float watch = guarding ? GuardSpan : (escorting ? 22f : 12f);
+        var found = Character.GetAllCharacters()
+            .Where(c => c && c != player && !c.IsDead() && !c.IsPlayer() && !c.IsTamed() && BaseAI.IsEnemy(player, c) &&
+                        Vector3.Distance(c.transform.position, watchFrom) <= watch)
+            // The boss is the point of the hunt; adds are a distraction from it.
+            .OrderByDescending(c => c.IsBoss()).ThenBy(c => Vector3.Distance(c.transform.position, watchFrom))
+            .FirstOrDefault();
+        if (!found || !WieldWeapon(player)) return false;
+        threat = found;
+        fightFrom = player.transform.position;
+        stuckTime = 0;
+        string name = Localization.instance.Localize(found.m_name);
+        Logger.LogInfo("Engaging " + name);
+        if (Time.time - lastShout > 10f) {
+            lastShout = Time.time;
+            Say(guarding ? name + " in the camp. I'll see to it."
+                : found.IsBoss() ? "The " + name + ". Together, then." : name + "! Stand back.");
+        }
+        return true;
+    }
+    // Below the fighting threshold with something still hitting him, standing still is
+    // just dying slowly. Run from the attacker, homeward if home lies that way.
+    bool Fleeing(Player player) {
+        if (player.GetHealth() >= player.GetMaxHealth() * 0.35f) return false;
+        return hurtBy && !hurtBy.IsDead() && Time.time - hurtAt < 8f &&
+               Vector3.Distance(hurtBy.transform.position, player.transform.position) < 25f;
+    }
+    void Flee(Player player) {
+        if (Time.time - lastShout > 8f) { lastShout = Time.time; Say("I'm hurt. Falling back — finish it without me."); }
+        Vector3 away = player.transform.position - hurtBy.transform.position;
+        away.y = 0;
+        if (away.sqrMagnitude < 0.0001f) away = player.transform.forward;
+        away.Normalize();
+        Vector3 goal = player.transform.position + away * 12f;
+        if (places.TryGetValue("home", out var home)) {
+            Vector3 toHome = home - player.transform.position;
+            toHome.y = 0;
+            if (toHome.magnitude > 5f && Vector3.Dot(toHome.normalized, away) > 0f) goal = home;
+        }
+        StepToward(player, goal, 2f);
+    }
+    void Engage(Player player) {
+        Vector3 edge = Edge(threat, player.transform.position);
+        // Out of stamina in melee is just free hits for the other side. Back off,
+        // let it come back, and close again when there is something to swing with.
+        if (player.GetStamina() < 8f && player.GetMaxStamina() > 0f) {
+            Vector3 away = player.transform.position - edge; away.y = 0;
+            if (away.sqrMagnitude > 0.0001f && away.magnitude < Reach(player, threat) * 2.5f) {
+                SwingAt(player, threat);  // keep facing it while giving ground
+                StepToward(player, player.transform.position + away.normalized * 6f, 0.5f);
+                return;
+            }
+        }
+        var step = StepToward(player, edge, Reach(player, threat));
+        if (step == Step.Arrived) { SwingAt(player, threat); return; }
+        // Cannot reach it: leave it and get back to work rather than grinding a wall.
+        if (step != Step.Moving) { threat = null; stuckTime = 0; }
+    }
+
+    internal void Drive(Player player) {
+        player.SetControls(Vector3.zero, false, false, false, false, false, false, false, false, false, false);
+        autorun.SetValue(player, false);
+        move.SetValue(player, Vector3.zero);
+        if (player.IsDead()) { Halt(); return; }
+        Graze(player);
+        if (Threatened(player)) { Engage(player); return; }
+        if (Fleeing(player)) { Flee(player); return; }
+        // Fetching a dropped meal never interrupts a fight, and never derails an
+        // errand he is already part-way through.
+        if (errand == Job.None && job != Job.Deliver && job != Job.Grave && Peckish(player)) { TakeMorsel(player); return; }
+        if (job == Job.None) return;
+        // Guard duty holds its post while hurt; every other job breaks off.
+        if (job != Job.Patrol && job != Job.Escort && (player.GetHealth() < player.GetMaxHealth() * 0.3f || player.IsSwimming())) { Halt("I must stop here. I cannot go on safely."); return; }
+        if (IsSweep && Time.time > sweepUntil) { FinishSweep("I have spent long enough at it."); return; }
+        // Checked before picking a target: a full pack or a blunt tool means the next
+        // thing to do is the errand, not another tree.
+        if ((IsSweep || job == Job.Mule) && errand == Job.None) {
+            if (Loaded(player) && StartHaul()) return;
+            if (Blunt(ToolFor(job)) && StartMend(ToolFor(job))) return;
+        }
+        if (Scavenging(player)) { Scavenge(player); return; }
+        if (!NextGoal(player, out Vector3 goal, out float arrival)) return;
+        if ((job == Job.Follow || job == Job.Escort) && target) {
+            Vector3 gap = target.transform.position - player.transform.position;
+            if (gap.magnitude > 35 || Math.Abs(gap.y) > 4) { Halt("You are beyond my reach. Return for me."); return; }
+        }
+        switch (StepToward(player, goal, arrival)) {
+            case Step.Arrived: Arrive(player); return;
+            case Step.Moving: return;
+            default:
+                // A blocked sweep target or patrol post is skipped, not fatal.
+                if (IsSweep && sweepTarget) { Skip(); return; }
+                if (job == Job.Patrol) { NextPost(); stuckTime = 0; return; }
+                Halt("The way is blocked. I will wait here.");
+                return;
+        }
+    }
+
+    bool CanJumpForward(Vector3 origin, Vector3 direction, int mask) {
+        direction.y = 0;
+        direction.Normalize();
+        // A chest-height hit with walkable ground beyond it is usually a step,
+        // stair lip, or small rock. Large walls are left to side-steering.
+        if (!Physics.Raycast(origin + Vector3.up * 0.65f, direction, out RaycastHit lip, 0.9f, mask) || lip.normal.y > 0.55f) return false;
+        Vector3 landing = origin + direction * 1.3f + Vector3.up * 1.2f;
+        return Physics.Raycast(landing, Vector3.down, out RaycastHit hit, 2.8f, mask) && hit.distance < 2.1f;
+    }
+
+    Vector3 SelectWalkDirection(Vector3 origin, Vector3 desired) {
+        int mask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain");
+        if (Time.time < avoidUntil && IsWalkable(origin, avoidDirection, mask)) return avoidDirection;
+
+        // Keep the desired heading when clear. Otherwise sample progressively wider
+        // turns. Holding the selected side briefly prevents left/right oscillation.
+        float[] angles = { 0f, -35f, 35f, -70f, 70f, -110f, 110f, 180f };
+        Vector3 best = Vector3.zero;
+        float bestScore = float.NegativeInfinity;
+        foreach (float angle in angles) {
+            Vector3 candidate = Quaternion.AngleAxis(angle, Vector3.up) * desired;
+            if (!IsWalkable(origin, candidate, mask)) continue;
+            float score = Vector3.Dot(candidate, desired) * 10f;
+            // Slightly prefer the side with more open space when both are viable.
+            if (Physics.Raycast(origin + Vector3.up * 0.6f, candidate, out RaycastHit hit, 3.5f, mask)) score += hit.distance;
+            else score += 3.5f;
+            if (score > bestScore) { bestScore = score; best = candidate; }
+        }
+        if (best != desired && best != Vector3.zero) { avoidDirection = best; avoidUntil = Time.time + 0.8f; }
+        return best;
+    }
+
+    bool IsWalkable(Vector3 origin, Vector3 direction, int mask) {
+        direction.y = 0;
+        if (direction.sqrMagnitude < 0.01f) return false;
+        direction.Normalize();
+        // Two rays let the bot squeeze around small corners while rejecting walls
+        // and drops before committing to a turn.
+        Vector3 chest = origin + Vector3.up * 0.65f;
+        if (Physics.Raycast(chest, direction, out RaycastHit obstacle, 1.35f, mask)) {
+            // Terrain rising in front of the player is a slope, not a wall.
+            if (obstacle.normal.y < 0.55f) return false;
+        }
+        // Probe from above the destination so uphill terrain is still found.
+        Vector3 foot = origin + direction * 1.35f + Vector3.up * 2.2f;
+        if (!Physics.Raycast(foot, Vector3.down, out RaycastHit ground, 4.5f, mask)) return false;
+        // Reject cliffs and near-vertical faces while allowing ordinary Valheim slopes.
+        return Vector3.Angle(ground.normal, Vector3.up) <= 48f;
+    }
+    [HarmonyPatch(typeof(PlayerController), "FixedUpdate")]
+    class Controls {
+        static bool Prefix(PlayerController __instance) {
+            var self = Instance;
+            if (self == null || !self.Active || __instance.GetComponent<Player>() != Player.m_localPlayer) return true;
+            self.Drive(Player.m_localPlayer); return false;
+        }
+    }
+    // Retaliation is driven by real damage, not by proximity, so a ranged attacker
+    // that never comes close still gets answered.
+    [HarmonyPatch(typeof(Character), "Damage")]
+    class Hurt {
+        static void Postfix(Character __instance, HitData hit) {
+            if (Instance == null || hit == null || __instance != Player.m_localPlayer) return;
+            Instance.Struck(hit);
+        }
+    }
+    // Death clears m_localPlayer, so the spot is captured before the game handles it
+    // and acted on once the new body has spawned.
+    [HarmonyPatch(typeof(Player), "OnDeath")]
+    class Death {
+        static void Prefix(Player __instance) {
+            if (Instance != null && __instance == Player.m_localPlayer) Instance.RememberGrave(__instance.transform.position);
+        }
+    }
+    [HarmonyPatch(typeof(Player), "OnSpawned")]
+    class Spawned {
+        static void Postfix(Player __instance) {
+            if (Instance != null && Player.m_localPlayer == __instance) Instance.AfterRespawn();
+        }
+    }
+    [HarmonyPatch(typeof(Chat), "OnNewChatMessage")]
+    class Messages {
+        static void Postfix(GameObject go, long senderID, string text) { Instance?.Receive(go, senderID, text); }
+    }
+}
+}
