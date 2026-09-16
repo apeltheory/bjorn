@@ -52,8 +52,8 @@ public class Companion : BaseUnityPlugin {
     ItemDrop salvage;  // Anything on the ground he is collecting while acting as a mule.
     float salvageScan, salvageAt;
     int muled;
-    int patrolStep;
-    float patrolRing;
+    int patrolStep, postsFailed;
+    float patrolRing, postUntil;
     Vector3 graveSpot;
     bool graveKnown;
     Player deliverTo;      // Who is owed a delivery once the fetching is done.
@@ -142,6 +142,7 @@ public class Companion : BaseUnityPlugin {
     void Halt(string reason = null) {
         job = Job.None; errand = Job.None; target = null; bed = null; sweepTarget = null; threat = null;
         asked = null; choices = null; onAnswer = null;
+        skippedDrops.Clear(); unreachable.Clear();
         deliverTo = null; deliverFilter = null; morsel = null;
         sweepFilter = null; visited.Clear(); piles.Clear(); stuckTime = 0; reachedAt = 0f;
         if (reason != null) { Logger.LogInfo("Stopped: " + reason); Say(reason); }
@@ -168,6 +169,7 @@ public class Companion : BaseUnityPlugin {
     void Forget(string why) {
         if (!asked) return;
         asked = null; choices = null; onAnswer = null;
+        skippedDrops.Clear(); unreachable.Clear();
         if (why != null) Say(why);
     }
     void Answered(string text) {
@@ -186,6 +188,7 @@ public class Companion : BaseUnityPlugin {
         if (pick == null) return;
         var act = onAnswer;
         asked = null; choices = null; onAnswer = null;
+        skippedDrops.Clear(); unreachable.Clear();
         Logger.LogInfo("Took '" + reply + "' as the answer.");
         if (pick != "no") act?.Invoke(pick); else Say("Right, I'll leave it.");
     }
@@ -579,7 +582,7 @@ public class Companion : BaseUnityPlugin {
         Say(campKnown
             ? "I know this camp: " + Mathf.RoundToInt(campSpan * 2f) + " paces across, centre " + Mathf.RoundToInt(Vector3.Distance(here, camp)) + " paces " + Compass(camp - here) + "."
             : "I've not surveyed a camp. Say 'learn the camp' standing in it.");
-        int chests = Nearby<Container>(here, 8f).Count();
+        int chests = Nearby<Container>(here, 8f).Count(IsChest);
         var station = me.GetCurrentCraftingStation();
         Say("Around me: " + (chests == 0 ? "no chest" : chests + (chests == 1 ? " chest" : " chests")) + ", " +
             (station ? Localization.instance.Localize(station.m_name) + " in range" : "no station in range") + ", " +
@@ -790,7 +793,8 @@ public class Companion : BaseUnityPlugin {
     bool Deposit(string requested) {
         var me = Player.m_localPlayer;
         string filter = Bare(requested);
-        var chest = Nearest<Container>(me.transform.position, 5f);
+        var chest = Nearby<Container>(me.transform.position, 5f).Where(IsChest)
+            .OrderBy(c => Vector3.Distance(c.transform.position, me.transform.position)).FirstOrDefault();
         if (!chest) { Say("No chest stands close enough to fill. Say 'dump it' and I'll pile it here instead."); return true; }
         var view = chest.GetComponent<ZNetView>();
         if (!view || !view.IsValid()) { Say("That chest will not answer me."); return true; }
@@ -807,7 +811,8 @@ public class Companion : BaseUnityPlugin {
     bool Withdraw(string requested) {
         var me = Player.m_localPlayer;
         string filter = Bare(requested);
-        var chest = Nearest<Container>(me.transform.position, 5f);
+        var chest = Nearby<Container>(me.transform.position, 5f).Where(IsChest)
+            .OrderBy(c => Vector3.Distance(c.transform.position, me.transform.position)).FirstOrDefault();
         if (!chest) {
             // "take a look around" is not an order to raid a chest that is not there.
             if (filter != null) return false;
@@ -911,7 +916,7 @@ public class Companion : BaseUnityPlugin {
         long crafter = Game.instance.GetPlayerProfile().GetPlayerID();
         int made = 0;
         bool full = false;
-        for (int i = 0; i < asked; i++) {
+        for (int i = 0; i < asked && made < asked; i++) {
             if (!me.HaveRequirements(recipe, false, 1)) break;
             if (!me.GetInventory().CanAddItem(recipe.m_item.gameObject, recipe.m_amount)) { full = true; break; }
             me.GetInventory().AddItem(recipe.m_item.gameObject.name, recipe.m_amount, 1, 0, crafter, me.GetPlayerName(), false);
@@ -943,6 +948,11 @@ public class Companion : BaseUnityPlugin {
     }
     static T Nearest<T>(Vector3 origin, float radius) where T : Component {
         return Nearby<T>(origin, radius).OrderBy(c => Vector3.Distance(c.transform.position, origin)).FirstOrDefault();
+    }
+    // TombStone carries a Container, so an unfiltered scan finds gravestones and will
+    // happily empty a load into someone's grave. Chests only.
+    static bool IsChest(Container box) {
+        return box && !box.GetComponent<TombStone>();
     }
     static bool IsLive(Component part) {
         var view = part ? part.GetComponent<ZNetView>() : null;
@@ -1034,6 +1044,7 @@ public class Companion : BaseUnityPlugin {
         morselScan = Time.time + 2f;
         morsel = Nearby<ItemDrop>(player.transform.position, 12f)
             .Where(d => IsLive(d) && !d.IsPiece() && d.m_itemData?.m_shared != null &&
+                        !skippedDrops.Contains(d.GetInstanceID()) &&
                         d.m_itemData.m_shared.m_food > 0f && player.CanEat(d.m_itemData, false))
             .OrderBy(d => Vector3.Distance(d.transform.position, player.transform.position)).FirstOrDefault();
         if (!morsel) { Beg(player); return false; }
@@ -1073,16 +1084,20 @@ public class Companion : BaseUnityPlugin {
     }
     // Walk over to one dropped item and take it. Clears `which` once the errand is
     // settled one way or another; returns true only on an actual pickup.
+    // Drops he has given up on, so a single unreachable item cannot make him shuttle
+    // back and forth forever instead of following you.
+    readonly HashSet<int> skippedDrops = new HashSet<int>();
     bool FetchDrop(Player player, ref ItemDrop which, ref float since) {
         var step = StepToward(player, which.transform.position, 1.6f);
         if (step != Step.Arrived) {
-            if (step != Step.Moving) { which = null; stuckTime = 0; }
+            if (step != Step.Moving) { skippedDrops.Add(which.GetInstanceID()); which = null; stuckTime = 0; }
             return false;
         }
         // Only the ZDO owner may pick an item up, so ask and retry for a few seconds.
         if (!which.CanPickup()) {
             if (since == 0f) since = Time.time;
-            if (Time.time - since > 3f) which = null; else which.RequestOwn();
+            if (Time.time - since > 3f) { skippedDrops.Add(which.GetInstanceID()); which = null; }
+            else which.RequestOwn();
             return false;
         }
         var drop = which;
@@ -1108,6 +1123,7 @@ public class Companion : BaseUnityPlugin {
         salvageScan = Time.time + 1f;
         salvage = Nearby<ItemDrop>(player.transform.position, 12f)
             .Where(d => IsLive(d) && !d.IsPiece() && d.m_itemData?.m_shared != null &&
+                        !skippedDrops.Contains(d.GetInstanceID()) &&
                         !NearAPile(piles, d.transform.position) &&
                         player.GetInventory().CanAddItem(d.m_itemData))
             .OrderBy(d => Vector3.Distance(d.transform.position, player.transform.position)).FirstOrDefault();
@@ -1224,9 +1240,11 @@ public class Companion : BaseUnityPlugin {
             from.RemoveItem(item);
             taken++;
         }
-        graveKnown = false;
         int left = from.GetAllItems().Count;
-        if (taken == 0) { Halt("My grave is here, but I cannot carry what is in it."); return; }
+        // Keep the grave remembered unless something actually came out of it, so
+        // "get your gear" can try again after making room.
+        if (taken == 0) { Halt("My grave is here, but I cannot carry what is in it. Free me some room and say 'get your gear'."); return; }
+        graveKnown = false;
         GearUp(player);
         Say("I have my gear back" + (left > 0 ? ", though " + left + " stacks stay behind." : ".") + (places.ContainsKey("home") ? " Heading home." : ""));
         if (places.ContainsKey("home")) GoToPlace("home"); else Halt();
@@ -1305,7 +1323,7 @@ public class Companion : BaseUnityPlugin {
             (houses > 0 ? ", about " + houses + (houses == 1 ? " building." : " buildings.") : "."));
         var stations = Nearby<CraftingStation>(camp, campSpan).GroupBy(s => Localization.instance.Localize(s.m_name))
             .Select(g => g.Count() + " " + g.Key).ToList();
-        Say("In it: " + Nearby<Container>(camp, campSpan).Count() + " chests, " +
+        Say("In it: " + Nearby<Container>(camp, campSpan).Count(IsChest) + " chests, " +
             Nearby<Bed>(camp, campSpan).Count() + " beds, " +
             Nearby<Fireplace>(camp, campSpan).Count() + " fires" +
             (stations.Count > 0 ? ", " + string.Join(", ", stations) + "." : ", no stations."));
@@ -1368,6 +1386,7 @@ public class Companion : BaseUnityPlugin {
         // A surveyed camp knows how big it is; otherwise fall back to measuring the
         // buildings near the point he was given.
         patrolRing = raw == null && campKnown ? Mathf.Clamp(campSpan * 0.85f, 6f, GuardSpan * 2f) : CampRadius(centre);
+        postsFailed = 0; postUntil = 0f;
         patrolStep = 0;
         NextPost();
         GearUp(me);
@@ -1658,7 +1677,7 @@ public class Companion : BaseUnityPlugin {
             biome = Heightmap.FindBiome(me.transform.position).ToString(),
             haveBed = TryParsePosition(bedPosition.Value, out _),
             places = places.Keys.ToArray(),
-            chestNearby = Nearest<Container>(me.transform.position, 5f) != null,
+            chestNearby = Nearby<Container>(me.transform.position, 5f).Any(IsChest),
             stationNearby = me.GetCurrentCraftingStation() != null,
             inventory = me.GetInventory().GetAllItems().Take(40).Select(i => new { name = Localization.instance.Localize(i.m_shared.m_name), count = i.m_stack })
         }});
@@ -1747,6 +1766,10 @@ public class Companion : BaseUnityPlugin {
             case Job.Haul:
                 goal = destination;
                 return true;
+            case Job.Mend:
+                // Mend walks to a station, then closes the last stride onto it.
+                goal = destination; arrival = 1.8f;
+                return true;
             case Job.Resume:
                 // A mule run ends back at whoever he is carrying for, not at a spot.
                 if ((errand == Job.Mule || errand == Job.Come) && target) { goal = target.transform.position; arrival = 4f; }
@@ -1818,7 +1841,7 @@ public class Companion : BaseUnityPlugin {
                 if (bed) bed.Interact(player, false, false);
                 Halt("I’ve reached the bed. The bed will decide if sleep is possible.");
                 break;
-            case Job.Patrol: NextPost(); break;
+            case Job.Patrol: postsFailed = 0; NextPost(); break;
             case Job.Grave: AtGrave(player); break;
             case Job.Deliver: HandOver(player); break;
             case Job.Mend: Mend(player); break;
@@ -1879,7 +1902,7 @@ public class Companion : BaseUnityPlugin {
     void Unload(Player player) {
         // A base is usually a row of chests, not one. Work along them nearest first
         // so a single full chest never stalls the run.
-        var chests = Nearby<Container>(player.transform.position, 8f)
+        var chests = Nearby<Container>(player.transform.position, 8f).Where(IsChest)
             .OrderBy(c => Vector3.Distance(c.transform.position, player.transform.position)).Take(8).ToList();
         int moved = 0;
         foreach (var chest in chests) {
@@ -1891,8 +1914,8 @@ public class Companion : BaseUnityPlugin {
         int piled = Loaded(player) && pileOver.Value ? Pile(player) : 0;
         if (moved == 0 && piled == 0) {
             Halt(chests.Count == 0
-                ? "I'm home with a full pack, but there's no chest here and you've told me not to pile it up."
-                : "The chests at home are full and I'm told not to pile the rest up.");
+                ? (pileOver.Value ? "I'm home with a full pack and nothing here to put it in." : "No chest here, and you've told me not to pile it up.")
+                : (pileOver.Value ? "The chests at home are full and there's nothing of mine worth leaving." : "The chests are full and you've told me not to pile the rest up."));
             return;
         }
         hauls++;
@@ -1916,9 +1939,10 @@ public class Companion : BaseUnityPlugin {
             else drop.RequestOwn();
             return;
         }
-        Skip();
-        if (player.Pickup(drop.gameObject, autoequip: false)) collected++;
-        else if (Loaded(player) && !StartHaul()) FinishSweep("My pack has no room left.");
+        if (player.Pickup(drop.gameObject, autoequip: false)) { Skip(); collected++; return; }
+        // Leave it unvisited: after a run home he should come back for this one.
+        sweepTarget = null; reachedAt = 0f;
+        if (Loaded(player) && !StartHaul()) FinishSweep("My pack has no room left.");
     }
     // One tick of walking toward a point. Every job and the fight overlay share it,
     // so steering, jumping, sprinting and stuck detection behave the same everywhere.
@@ -1990,6 +2014,15 @@ public class Companion : BaseUnityPlugin {
             // The boss is the point of the hunt; adds are a distraction from it.
             .OrderByDescending(c => c.IsBoss()).ThenBy(c => Vector3.Distance(c.transform.position, watchFrom))
             .FirstOrDefault();
+        if (found && unreachable.Contains(found.GetInstanceID())) {
+            // Already proved he cannot get to this one. Take the next best, or none.
+            found = Character.GetAllCharacters()
+                .Where(c => c && c != player && !c.IsDead() && !c.IsPlayer() && !c.IsTamed() && BaseAI.IsEnemy(player, c) &&
+                            !unreachable.Contains(c.GetInstanceID()) &&
+                            Vector3.Distance(c.transform.position, watchFrom) <= watch)
+                .OrderByDescending(c => c.IsBoss()).ThenBy(c => Vector3.Distance(c.transform.position, watchFrom))
+                .FirstOrDefault();
+        }
         if (!found || !WieldWeapon(player)) return false;
         threat = found;
         fightFrom = player.transform.position;
@@ -2024,7 +2057,12 @@ public class Companion : BaseUnityPlugin {
         }
         StepToward(player, goal, 2f);
     }
+    // Foes he has proved he cannot reach, so he stops re-picking them every scan.
+    // Cleared periodically, because terrain and the foe both move.
+    readonly HashSet<int> unreachable = new HashSet<int>();
+    float forgetUnreachable;
     void Engage(Player player) {
+        if (Time.time > forgetUnreachable) { unreachable.Clear(); forgetUnreachable = Time.time + 30f; }
         Vector3 edge = Edge(threat, player.transform.position);
         // Out of stamina in melee is just free hits for the other side. Back off,
         // let it come back, and close again when there is something to swing with.
@@ -2038,8 +2076,13 @@ public class Companion : BaseUnityPlugin {
         }
         var step = StepToward(player, edge, Reach(player, threat));
         if (step == Step.Arrived) { SwingAt(player, threat); return; }
-        // Cannot reach it: leave it and get back to work rather than grinding a wall.
-        if (step != Step.Moving) { threat = null; stuckTime = 0; }
+        // Cannot reach it: remember that, so the next scan does not pick it straight
+        // back up and freeze the job he was doing.
+        if (step != Step.Moving) {
+            unreachable.Add(threat.GetInstanceID());
+            Logger.LogInfo("Cannot reach " + Localization.instance.Localize(threat.m_name) + "; leaving it.");
+            threat = null; stuckTime = 0;
+        }
     }
 
     internal void Drive(Player player) {
@@ -2055,7 +2098,12 @@ public class Companion : BaseUnityPlugin {
         if (errand == Job.None && job != Job.Deliver && job != Job.Grave && Peckish(player)) { TakeMorsel(player); return; }
         if (job == Job.None) return;
         // Guard duty holds its post while hurt; every other job breaks off.
-        if (job != Job.Patrol && job != Job.Escort && (player.GetHealth() < player.GetMaxHealth() * 0.3f || player.IsSwimming())) { Halt("I must stop here. I cannot go on safely."); return; }
+        if (job != Job.Patrol && job != Job.Escort && player.GetHealth() < player.GetMaxHealth() * 0.3f) { Halt("I must stop here. I cannot go on safely."); return; }
+        // Swimming is fine; drowning is not. Let him cross water, and only break off
+        // when the stamina that keeps him afloat is running out.
+        if (player.IsSwimming()) {
+            if (player.GetStamina() < player.GetMaxStamina() * 0.15f) { Halt("The water's taking my strength. I'm turning back."); return; }
+        }
         if (IsSweep && Time.time > sweepUntil) { FinishSweep("I have spent long enough at it."); return; }
         // Checked before picking a target: a full pack or a blunt tool means the next
         // thing to do is the errand, not another tree.
@@ -2067,7 +2115,10 @@ public class Companion : BaseUnityPlugin {
         if (!NextGoal(player, out Vector3 goal, out float arrival)) return;
         if ((job == Job.Follow || job == Job.Escort) && target) {
             Vector3 gap = target.transform.position - player.transform.position;
-            if (gap.magnitude > 35 || Math.Abs(gap.y) > 4) { Halt("You are beyond my reach. Return for me."); return; }
+            // Only genuine distance ends a follow. A height gap is a staircase or a
+            // boulder far more often than it is somewhere he cannot go, so he walks
+            // to below you and lets the stuck check decide.
+            if (gap.magnitude > 35 || Math.Abs(gap.y) > 20) { Halt("You are beyond my reach. Return for me."); return; }
         }
         switch (StepToward(player, goal, arrival)) {
             case Step.Arrived: Arrive(player); return;
@@ -2075,7 +2126,15 @@ public class Companion : BaseUnityPlugin {
             default:
                 // A blocked sweep target or patrol post is skipped, not fatal.
                 if (IsSweep && sweepTarget) { Skip(); return; }
-                if (job == Job.Patrol) { NextPost(); stuckTime = 0; return; }
+                if (job == Job.Patrol) {
+                    // Try the next post, but no faster than a person would, and give up
+                    // rather than spinning through the ring forever.
+                    if (Time.time < postUntil) return;
+                    postUntil = Time.time + 1f;
+                    if (++postsFailed >= 8) { Halt("I cannot walk the bounds from here. Set me somewhere clearer."); return; }
+                    NextPost(); stuckTime = 0;
+                    return;
+                }
                 Halt("The way is blocked. I will wait here.");
                 return;
         }
