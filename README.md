@@ -285,6 +285,35 @@ patch of terrain that defeats him repeatedly shows up as a coordinate rather tha
 feeling. It also counts how many failures happened with `hands=EMPTY`, which is its own
 distinct bug.
 
+## Tending the fires
+
+`tend the smelter` / `tend the kiln` / `tend the furnace` / `smelt`. Smelters, kilns, blast
+furnaces and windmills are all the same component in Valheim, driven by three switches
+rather than an ordinary interaction, so one order covers all of them.
+
+He walks a circuit of every one within 40 metres: takes the finished metal out first (or
+there may be no room to put ore in), tops up the coal, loads the ore, and moves to the next.
+He keeps circling while there is anything left to shift, and stops when a full round moves
+nothing — which is what running out of ore or coal looks like from the outside.
+
+## Asking him things about Valheim
+
+**Recipes come from the game, not from memory.**
+
+```
+Bjorn, what do I need for a bronze axe?
+Bjorn, how do I make wood arrows?
+Bjorn, recipe for a fine bow
+```
+
+He reads those out of `ObjectDB` — the installed game's own data — so the answer is exactly
+right for your version and any mods you run, costs no API call, and works with the planner
+down. Model memory can drift on exact quantities; the game cannot.
+
+Anything else about Valheim — where something is found, which boss comes next, what a
+creature is weak to — goes to the planner and is answered plainly, in his voice. There is no
+wiki baked in and there does not need to be.
+
 ## Asking him things
 
 Anything that is not an order goes to the planner and comes back in his own voice, with

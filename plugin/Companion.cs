@@ -18,7 +18,7 @@ public class Companion : BaseUnityPlugin {
     internal static Companion Instance;
     // Jobs are the only orders that need steering every tick. Everything else
     // finishes inside Receive or Decide and leaves the bot standing.
-    enum Job { None, Follow, Come, Home, Bed, Fetch, Harvest, Chop, Mine, Fight, Haul, Mend, Resume, Patrol, Grave, Deliver, Escort, Mule }
+    enum Job { None, Follow, Come, Home, Bed, Fetch, Harvest, Chop, Mine, Fight, Haul, Mend, Resume, Patrol, Grave, Deliver, Escort, Mule, Tend }
     // Outcome of one tick of walking toward a point.
     enum Step { Moving, Arrived, Blocked, Stuck }
     const float TargetSeconds = 30f; // Abandon one tree, rock, or foe that will not fall.
@@ -50,6 +50,8 @@ public class Companion : BaseUnityPlugin {
     int begged;
     ItemDrop morsel;   // Food on the ground he is walking over to collect.
     ItemDrop salvage;  // Anything on the ground he is collecting while acting as a mule.
+    Smelter furnace;   // The smelter or kiln he is walking to.
+    int lastRound;     // Tally at the end of the last circuit of the fires.
     float salvageScan, salvageAt;
     int muled;
     int patrolStep, postsFailed;
@@ -151,6 +153,7 @@ public class Companion : BaseUnityPlugin {
     }
     void Halt(string reason = null) {
         job = Job.None; errand = Job.None; target = null; bed = null; sweepTarget = null; threat = null;
+        furnace = null; lastRound = 0;
         asked = null; choices = null; onAnswer = null;
         skippedDrops.Clear(); unreachable.Clear(); mendTried = false;
         deliverTo = null; deliverFilter = null; morsel = null;
@@ -475,6 +478,8 @@ public class Companion : BaseUnityPlugin {
         if (Any(plain, "where are you", "where", "location", "position")) { Where(); return; }
         if (Any(plain, "look around", "what do you see", "scan", "what is nearby", "anything nearby")) { Scan(); return; }
         if (Any(plain, "self test", "selftest", "sound off", "check yourself", "diagnostics", "are you working")) { SelfTest(); return; }
+        if (Any(simple, "tend the fires", "tend the smelter", "tend the furnace", "tend the kiln", "work the smelter",
+                        "feed the smelter", "feed the furnace", "smelt", "tend", "mind the fires")) { Tend(null); return; }
         if (Any(simple, "learn the camp", "survey the camp", "look over the camp", "study the camp", "learn this place")) { Survey(true); return; }
         if (Any(plain, "what is in the camp", "whats in the camp", "describe the camp", "tell me about the camp", "how big is the camp")) { CampReport(null); return; }
         if (Any(simple, "set home")) { RememberPlace("home"); return; }
@@ -518,9 +523,14 @@ public class Companion : BaseUnityPlugin {
         // named. "drop everything and follow me" or "pick a fight" find nothing, so
         // they fall past these lines to the planner, which reads the whole sentence.
         string rest;
+        foreach (var lead in new[] { "how do i make ", "how do you make ", "how is ", "how do i craft ",
+                                     "what do i need for ", "what do you need for ", "what does it take for ",
+                                     "recipe for ", "whats in ", "what's in ", "what makes " })
+            if (Prefixed(simple, order, lead, out rest) && Recipes(rest)) return;
         if (Prefixed(simple, order, "remember this as ", out rest) && RememberPlace(rest)) return;
         if (Prefixed(simple, order, "remember this place as ", out rest) && RememberPlace(rest)) return;
         if (Prefixed(simple, order, "remember here as ", out rest) && RememberPlace(rest)) return;
+        if (Prefixed(simple, order, "tend ", out rest) && Tend(rest)) return;
         if (Prefixed(simple, order, "guard ", out rest) && Guard(rest)) return;
         if (Prefixed(simple, order, "patrol ", out rest) && Guard(rest)) return;
         if (Prefixed(simple, order, "go to ", out rest) && GoToPlace(rest)) return;
@@ -679,6 +689,7 @@ public class Companion : BaseUnityPlugin {
             case Job.Patrol: return "on guard";
             case Job.Mend: return "off to mend my gear";
             case Job.Grave: return "going back for my gear";
+            case Job.Tend: return "tending the fires";
             case Job.Deliver: return "bringing you " + (deliverFilter ?? "something");
             case Job.Haul: return "carrying a full pack home";
             case Job.Resume: return "walking back to the job";
@@ -1156,6 +1167,27 @@ public class Companion : BaseUnityPlugin {
         Say("Made " + made + " " + name + (made < asked ? ", then ran short." : "."));
         return true;
     }
+    // Recipe questions are answered from ObjectDB, not from anything remembered. That
+    // is the installed game's own data, so it is exactly right for this version and
+    // any mods, costs no API call, and works with the planner down.
+    bool Recipes(string wanted) {
+        string key = Key(Bare(wanted) ?? "");
+        if (key.Length < 3 || !ObjectDB.instance) return false;
+        var known = ObjectDB.instance.m_recipes.Where(r => r && r.m_item && r.m_enabled).ToList();
+        var recipe = known.FirstOrDefault(r => Key(RecipeName(r)) == key)
+                  ?? known.FirstOrDefault(r => KeyMatches(RecipeName(r), key));
+        if (recipe == null) return false;
+        string name = Localization.instance.Localize(recipe.m_item.m_itemData.m_shared.m_name);
+        var parts = recipe.m_resources.Where(x => x.m_resItem)
+            .Select(x => x.m_amount + " " + Localization.instance.Localize(x.m_resItem.m_itemData.m_shared.m_name)).ToList();
+        var station = recipe.GetRequiredStation(1);
+        string made = recipe.m_amount > 1 ? recipe.m_amount + " " + name : name;
+        Say(parts.Count == 0
+            ? made + " takes nothing I can name."
+            : made + ": " + string.Join(", ", parts) +
+              (station ? ", at a " + Localization.instance.Localize(station.m_name) + "." : ", by hand."));
+        return true;
+    }
     static string RecipeName(Recipe recipe) {
         return Localization.instance.Localize(recipe.m_item.m_itemData.m_shared.m_name);
     }
@@ -1499,6 +1531,47 @@ public class Companion : BaseUnityPlugin {
         GearUp(player);
         Say("I have my gear back" + (left > 0 ? ", though " + left + " stacks stay behind." : ".") + (places.ContainsKey("home") ? " Heading home." : ""));
         if (places.ContainsKey("home")) GoToPlace("home"); else Halt();
+    }
+
+    // ---- Tending the fires -----------------------------------------------
+    //
+    // Smelters, kilns, blast furnaces and windmills are all Smelter, and all driven by
+    // three public Switches rather than a plain Interact. Each switch handles exactly
+    // one unit and returns whether it did anything, so the loop is also the count -
+    // no need for the private queue and fuel accessors.
+    int Work(Smelter smelter, Player player) {
+        int moved = 0;
+        // Take the finished metal out first, or there may be no room to put ore in.
+        for (int i = 0; i < 40 && smelter.m_emptyOreSwitch && smelter.m_emptyOreSwitch.Interact(player, false, false); i++) moved++;
+        for (int i = 0; i < 40 && smelter.m_addWoodSwitch && smelter.m_addWoodSwitch.Interact(player, false, false); i++) moved++;
+        for (int i = 0; i < 40 && smelter.m_addOreSwitch && smelter.m_addOreSwitch.Interact(player, false, false); i++) moved++;
+        if (moved > 0) Logger.LogInfo("Worked " + smelter.m_name + ": " + moved + " items in or out.");
+        return moved;
+    }
+    Smelter NextFurnace(Vector3 from) {
+        return Nearby<Smelter>(anchor, 40f)
+            .Where(s => s && !visited.Contains(s.GetInstanceID()) && IsLive(s))
+            .OrderBy(s => Vector3.Distance(s.transform.position, from)).FirstOrDefault();
+    }
+    bool Tend(string raw) {
+        var me = Player.m_localPlayer;
+        string filter = Bare(raw);
+        var found = Nearby<Smelter>(me.transform.position, 40f)
+            .Where(s => s && IsLive(s) && (filter == null || KeyMatches(s.m_name, Key(filter)))).ToList();
+        if (found.Count == 0) {
+            if (filter != null) return false;   // a named thing he cannot see: let the planner read it
+            Say("I see no smelter or kiln near enough to tend.");
+            return true;
+        }
+        Begin(Job.Tend);
+        anchor = me.transform.position;
+        sweepFilter = filter;
+        collected = 0;
+        sweepUntil = Time.time + SweepSeconds;
+        Say(found.Count == 1
+            ? "I'll see to the " + found[0].m_name + "."
+            : "I'll work the " + found.Count + " of them, and keep at it.");
+        return true;
     }
 
     // ---- Knowing the camp ------------------------------------------------
@@ -2037,6 +2110,8 @@ public class Companion : BaseUnityPlugin {
                 case "scan": Scan(); break;
                 case "self_test": SelfTest(); break;
                 case "survey": Survey(true); break;
+                case "tend": if (!Tend(item)) Say("I see no " + item + " to tend."); break;
+                case "recipe": if (!Recipes(item ?? decision.reply)) Say("I know no recipe by that name."); break;
                 case "camp": CampReport(null); break;
                 case "remember_home": RememberPlace(item ?? "home"); break;
                 case "go_home": if (item == null) GoHome(); else if (!GoToPlace(item)) Say("I know no place called that."); break;
@@ -2109,6 +2184,17 @@ public class Companion : BaseUnityPlugin {
             case Job.Grave:
                 goal = destination;
                 return true;
+            case Job.Tend:
+                if (Time.time > sweepUntil) { Halt(collected == 0 ? "Nothing more to do at the fires." : "Fires tended: " + collected + " items shifted."); return false; }
+                if (!furnace) {
+                    furnace = NextFurnace(player.transform.position);
+                    // A full round with nothing to shift means the ore or the coal has
+                    // run out, and standing there poking a cold smelter helps nobody.
+                    if (!furnace && collected > lastRound) { lastRound = collected; visited.Clear(); furnace = NextFurnace(player.transform.position); }
+                    if (!furnace) { Halt(collected == 0 ? "Nothing to shift — no ore, no coal, or nothing ready." : "Fires tended: " + collected + " items shifted."); return false; }
+                }
+                goal = furnace.transform.position; arrival = 2.5f;
+                return true;
             case Job.Deliver:
                 if (!target) { Halt("I have what you asked for, but I have lost you."); return false; }
                 goal = target.transform.position; arrival = 2.5f;
@@ -2172,6 +2258,11 @@ public class Companion : BaseUnityPlugin {
                 break;
             case Job.Patrol: postsFailed = 0; NextPost(); break;
             case Job.Grave: AtGrave(player); break;
+            case Job.Tend:
+                visited.Add(furnace.GetInstanceID());
+                collected += Work(furnace, player);
+                furnace = null;
+                break;
             case Job.Deliver: HandOver(player); break;
             case Job.Mend: Mend(player); break;
             case Job.Haul: Unload(player); break;
