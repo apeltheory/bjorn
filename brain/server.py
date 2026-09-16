@@ -86,6 +86,7 @@ DIRECT = {
     'deposit': 'deposit', 'stash': 'deposit',
     'take all': 'withdraw', 'take everything': 'withdraw',
     'repair': 'repair', 'mend': 'repair', 'repair your stuff': 'repair', 'fix your gear': 'repair',
+    'repair your axe': 'repair', 'go chop down some trees': 'chop', 'chop down some trees': 'chop',
     'eat': 'eat', 'eat up': 'eat', 'eat something': 'eat',
 }
 QUIET = {'inventory', 'status', 'where', 'scan', 'places', 'self_test', 'survey', 'camp'}

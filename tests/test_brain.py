@@ -40,6 +40,12 @@ class BrainTests(unittest.TestCase):
                                 ('eat up', 'eat'), ('eat something', 'eat'), ('dump it', 'pile')]:
             self.assertEqual(offline(message)['action'], action)
 
+    def test_loose_phrasings_still_work_with_the_api_down(self):
+        # These are answered locally by the plugin now, but the offline table is the
+        # backstop when an order does reach a planner with no key or no budget left.
+        for message, action in [('repair your axe', 'repair'), ('go chop down some trees', 'chop')]:
+            self.assertEqual(offline(message)['action'], action)
+
     def test_offline_actions_are_all_in_the_contract(self):
         self.assertTrue({offline(m)['action'] for m in ['chop', 'mine', 'fight', 'craft a shield']} <= ACTIONS)
 

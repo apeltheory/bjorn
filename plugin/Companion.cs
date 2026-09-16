@@ -251,6 +251,32 @@ public class Companion : BaseUnityPlugin {
         while (words.Count > 0 && filler.Contains(words[words.Count - 1])) words.RemoveAt(words.Count - 1);
         return words.Count == 0 ? null : string.Join(" ", words);
     }
+    // People do not phrase orders the way a command table is written. "go chop down
+    // some trees" and "repair your axe" both used to cost a fifteen-second round trip
+    // to the planner, and a call off the budget, for something he can do this instant
+    // and could still do with the planner down. Matched on whole words, only after
+    // every exact and prefixed form has failed.
+    static bool Mentions(string[] words, params string[] any) {
+        foreach (var word in words)
+            foreach (var option in any)
+                if (word == option) return true;
+        return false;
+    }
+    bool Loosely(string simple, Player speaker) {
+        var words = simple.Split(new[] { ' ', ',', '.', '!', '?', ';', ':', '\'' }, StringSplitOptions.RemoveEmptyEntries);
+        // "don't follow me" and "no, stop chopping" must not be read as orders to do it.
+        if (Mentions(words, "dont", "don't", "never", "nor", "instead")) return false;
+        if (Mentions(words, "repair", "mend", "fix", "repaired")) { Repair(); return true; }
+        if (Mentions(words, "chop", "chopping", "fell", "felling", "cut") &&
+            Mentions(words, "tree", "trees", "wood", "timber", "log", "logs")) { Chop(); return true; }
+        if (Mentions(words, "mine", "mining", "dig") &&
+            Mentions(words, "stone", "ore", "rock", "rocks", "copper", "tin", "iron", "silver")) { Mine(); return true; }
+        if (Mentions(words, "guard", "patrol", "defend", "watch") &&
+            Mentions(words, "camp", "base", "home", "village", "bounds")) { Guard(null); return true; }
+        if (Mentions(words, "forage", "berries", "mushrooms")) { Harvest(null); return true; }
+        if (Mentions(words, "follow")) { Follow(speaker); return true; }
+        return false;
+    }
     static string Normalize(string text) {
         if (string.IsNullOrWhiteSpace(text)) return null;
         return text.Trim().Trim('.', '!', '?').ToLowerInvariant();
@@ -428,6 +454,7 @@ public class Companion : BaseUnityPlugin {
         if (Prefixed(simple, order, "equip ", out rest) && EquipNamed(rest)) return;
         if (Prefixed(simple, order, "emote ", out rest) && Emote(Normalize(rest))) return;
         if (Emote(simple)) return;
+        if (Loosely(simple, speaker)) return;
         Logger.LogInfo("No direct command matched; asking the planner to read it.");
         StartCoroutine(Decide(order, speaker, ++generation));
     }
