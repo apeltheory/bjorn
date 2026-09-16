@@ -557,7 +557,9 @@ public class Companion : BaseUnityPlugin {
         if (Any(simple, "feed the fire", "stoke the fire", "tend the fire", "add wood to the fire")) { FeedFire(); return; }
         if (Any(simple, "open the door", "open door", "open")) { UseDoor(true); return; }
         if (Any(simple, "close the door", "close door", "close", "shut the door")) { UseDoor(false); return; }
-        if (Any(simple, "deposit", "stash", "unload", "empty your pack", "put everything in the chest")) { Deposit(null); return; }
+        if (Any(simple, "deposit", "stash", "unload", "deposit your loot", "stash the loot")) { Deposit(null); return; }
+        if (Any(simple, "deposit everything", "stash everything", "empty your pack", "put everything in the chest", "deposit all")) { Deposit(null, true); return; }
+        if (Any(plain, "what is in the chests", "whats in the chests", "check the chests", "what do we have", "what have we got")) { Stock(null); return; }
         if (Any(simple, "unequip all", "put your gear away", "stow your gear")) { UnequipAll(); return; }
         // Each verb below only claims the order if it can actually find what was
         // named. "drop everything and follow me" or "pick a fight" find nothing, so
@@ -874,11 +876,27 @@ public class Companion : BaseUnityPlugin {
         // soup" - so only requests of real length are matched loosely.
         return key.Length >= 3 && name.Contains(key);
     }
-    static bool NameMatches(ItemDrop.ItemData item, string wanted) {
+    static bool OneNameMatches(ItemDrop.ItemData item, string wanted) {
         string key = Key(wanted);
         return KeyMatches(Localization.instance.Localize(item.m_shared.m_name), key) ||
                KeyMatches(item.m_shared.m_name, key) ||
                (item.m_dropPrefab && KeyMatches(item.m_dropPrefab.name, key));
+    }
+    // People ask for more than one thing at a time - "the axe and club", "wood, stone".
+    // A single filter string matched neither, so the planner left the item empty, and an
+    // empty item means everything: he emptied the whole chest.
+    static readonly string[] alsoWords = { " and ", " & ", ",", " plus " };
+    static string[] Names(string wanted) {
+        if (wanted == null) return null;
+        var parts = wanted.Split(alsoWords, StringSplitOptions.RemoveEmptyEntries)
+            .Select(Bare).Where(x => x != null).ToArray();
+        return parts.Length > 0 ? parts : null;
+    }
+    static bool NameMatches(ItemDrop.ItemData item, string wanted) {
+        var names = Names(wanted);
+        if (names == null) return false;
+        foreach (var name in names) if (OneNameMatches(item, name)) return true;
+        return false;
     }
     ItemDrop.ItemData FindItem(string requested, bool foodOnly, bool equipOnly) {
         string wanted = Bare(requested);
@@ -986,7 +1004,10 @@ public class Companion : BaseUnityPlugin {
         }
         return moved;
     }
-    bool Deposit(string requested) {
+    // "Deposit your loot" means loot. Treating an explicit order as licence to hand over
+    // his axe, torch and club was the wrong reading of "explicit" - only "deposit
+    // everything" means that, and a named item means exactly that item.
+    bool Deposit(string requested, bool everything = false) {
         var me = Player.m_localPlayer;
         string filter = Bare(requested);
         var chest = Nearby<Container>(me.transform.position, 5f).Where(IsChest)
@@ -994,14 +1015,58 @@ public class Companion : BaseUnityPlugin {
         if (!chest) { Say("No chest stands close enough to fill. Say 'dump it' and I'll pile it here instead."); return true; }
         var view = chest.GetComponent<ZNetView>();
         if (!view || !view.IsValid()) { Say("That chest will not answer me."); return true; }
+        bool keepKit = !everything && filter == null;
         bool full;
-        int moved = MoveInto(chest, filter, false, out full);
+        int moved = MoveInto(chest, filter, keepKit, out full);
         if (moved == 0) {
             if (filter != null && !full) return false;
             Say(full ? "The chest has no room left. Say 'dump it' and I'll pile it here." : "I have nothing to put in there.");
             return true;
         }
-        Say("I put " + moved + (moved == 1 ? " stack" : " stacks") + " in the chest" + (full ? ", then it filled up." : "."));
+        Say("I put " + moved + (moved == 1 ? " stack" : " stacks") + " in the chest" +
+            (full ? ", then it filled up." : ".") + (keepKit ? " Kept my gear." : ""));
+        return true;
+    }
+
+    // What the camp is holding. Containers must be loaded to be read, which at camp range
+    // they are - so "do we have any deer hide" is answerable without walking him round
+    // opening every box.
+    bool Stock(string requested) {
+        var me = Player.m_localPlayer;
+        string filter = Bare(requested);
+        Vector3 from = campKnown ? camp : me.transform.position;
+        float span = campKnown ? campSpan : 30f;
+        var chests = Nearby<Container>(from, span).Where(IsChest).Take(40).ToList();
+        if (chests.Count == 0) {
+            Say(campKnown ? "I see no chests in the camp from here." : "No chests near me. Say 'learn the camp' in your base.");
+            return true;
+        }
+        var tally = new Dictionary<string, int>();
+        void Count(ItemDrop.ItemData item) {
+            string name = Localization.instance.Localize(item.m_shared.m_name);
+            tally[name] = (tally.TryGetValue(name, out int had) ? had : 0) + item.m_stack;
+        }
+        foreach (var chest in chests)
+            foreach (var item in chest.GetInventory().GetAllItems()) Count(item);
+        // His own pack counts too: "do we have any" means us, not the boxes alone.
+        int carried = 0;
+        foreach (var item in me.GetInventory().GetAllItems()) {
+            Count(item);
+            if (filter != null && NameMatches(item, filter)) carried += item.m_stack;
+        }
+        if (filter != null) {
+            var names = Names(filter);
+            var hit = tally.Where(x => names != null && names.Any(n => KeyMatches(x.Key, Key(n))))
+                .OrderByDescending(x => x.Value).ToList();
+            Say(hit.Count == 0
+                ? "No " + filter + " in the camp, nor on me."
+                : string.Join(", ", hit.Take(3).Select(x => x.Value + " " + x.Key)) + " — across " +
+                  chests.Count + (chests.Count == 1 ? " chest" : " chests") +
+                  (carried > 0 ? " and my pack." : "."));
+            return true;
+        }
+        Say("In " + chests.Count + " chests and my pack: " + string.Join(", ", tally
+            .OrderByDescending(x => x.Value).Take(8).Select(x => x.Key + " x" + x.Value)) + ".");
         return true;
     }
     bool Withdraw(string requested) {
@@ -2227,6 +2292,7 @@ public class Companion : BaseUnityPlugin {
                 case "fight": if (!Fight(item)) Say("I see no " + item + " to fight."); break;
                 case "guard": if (!Guard(item)) Say("I know no place called that to guard."); break;
                 case "deposit": if (!Deposit(item)) Say("I have no " + item + " to put away."); break;
+                case "stock": Stock(item); break;
                 case "withdraw": if (!Withdraw(item)) Say("I find no " + item + " to take."); break;
                 case "drop_all": DropAll(); break;
                 case "pile": {
