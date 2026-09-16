@@ -65,12 +65,16 @@ public class Companion : BaseUnityPlugin {
     int collected, hauls;
     float sweepUntil, reachedAt, swingUntil;
     Component sweepTarget;
-    Job errand;  // The sweep to pick back up after a run home; None when not hauling.
+    Job errand;      // The interrupted real job, held for the length of a detour chain.
+    int detours;     // Detours this job has spawned. Only a new order clears it.
+    int futile;      // Consecutive detours that changed nothing in the world.
+    bool mendRefused;
+    const int MaxDetours = 12, MaxFutile = 3;
     Character threat;      // What he is fighting right now, whatever job he was on.
     Character hurtBy;      // Whoever last actually landed a hit on him.
     float hurtAt;
     Vector3 fightFrom;     // Where a self-defence fight started, so he does not chase far.
-    float threatScan, lastShout, grazeCheck, morselScan, lastBeg, morselAt, hungrySince, mendRefused, handsChecked;
+    float threatScan, lastShout, grazeCheck, morselScan, lastBeg, morselAt, hungrySince, handsChecked;
     int begged;
     ItemDrop morsel;   // Food on the ground he is walking over to collect.
     ItemDrop salvage;  // Anything on the ground he is collecting while acting as a mule.
@@ -80,7 +84,6 @@ public class Companion : BaseUnityPlugin {
     int muled;
     int patrolStep, postsFailed;
     bool scoring;    // Whether the current breakable counts toward the tally.
-    bool mendTried;  // A bench detour already spent on this job.
 
     float patrolRing, postUntil;
     Vector3 graveSpot;
@@ -176,13 +179,31 @@ public class Companion : BaseUnityPlugin {
         FreshAll();
         furnace = null; lastRound = 0;
         asked = null; choices = null; onAnswer = null;
-        skippedDrops.Clear(); unreachable.Clear(); mendTried = false;
+        skippedDrops.Clear(); unreachable.Clear();
         deliverTo = null; deliverFilter = null; morsel = null;
-        sweepFilter = null; visited.Clear(); piles.Clear(); reachedAt = 0f;
+        // piles is NOT cleared here. FinishSweep halts and a chain re-enters at once,
+        // so clearing would hand the next sweep an empty skip list and let him collect
+        // the load he just dumped, carry it home, and dump it again.
+        sweepFilter = null; visited.Clear(); reachedAt = 0f;
         if (reason != null) { Logger.LogInfo("Stopped: " + reason); Say(reason); }
     }
+    // Valheim's own pickup gives up on carry weight well before the last slot fills,
+    // so a haul has to trigger on either.
+    static bool Loaded(Player player) {
+        return !player.GetInventory().HaveEmptySlot() ||
+               player.GetInventory().GetTotalWeight() >= player.GetMaxCarryWeight() * 0.9f;
+    }
     // Clear any running job and start a fresh one from the bot's current spot.
-    void Begin(Job next) { Halt(); job = next; }
+    void Begin(Job next) {
+        Halt();
+        job = next;
+        // Job.Resume falls back to `anchor`, which only Sweep and Guard ever wrote - so
+        // on a fresh session a Resume after a haul walked to world origin. Where the
+        // order was given is always a safe answer.
+        anchor = Player.m_localPlayer ? Player.m_localPlayer.transform.position : Vector3.zero;
+        piles.Clear();
+        detours = 0; futile = 0; mendRefused = false;
+    }
     static bool Any(string value, params string[] options) { return options.Contains(value); }
 
     // ---- Asking, and listening for the answer ----------------------------
@@ -203,7 +224,6 @@ public class Companion : BaseUnityPlugin {
     void Forget(string why) {
         if (!asked) return;
         asked = null; choices = null; onAnswer = null;
-        skippedDrops.Clear(); unreachable.Clear(); mendTried = false;
         if (why != null) Say(why);
     }
     void Answered(string text) {
@@ -222,7 +242,6 @@ public class Companion : BaseUnityPlugin {
         if (pick == null) return;
         var act = onAnswer;
         asked = null; choices = null; onAnswer = null;
-        skippedDrops.Clear(); unreachable.Clear(); mendTried = false;
         Logger.LogInfo("Took '" + reply + "' as the answer.");
         if (pick != "no") act?.Invoke(pick); else Say("Right, I'll leave it.");
     }
@@ -694,8 +713,9 @@ public class Companion : BaseUnityPlugin {
         var names = items.GroupBy(i => i.m_shared.m_name).Select(g => Localization.instance.Localize(g.Key) + " x" + g.Sum(i => i.m_stack));
         Say(items.Count == 0 ? "My pack is empty." : "In my pack: " + string.Join(", ", names));
     }
-    string JobWord() {
-        switch (job) {
+    string JobWord() { return JobWord(job); }
+    string JobWord(Job which) {
+        switch (which) {
             case Job.Follow: return target ? "following " + target.GetPlayerName() : "following";
             case Job.Come: return "on my way to you";
             case Job.Escort: return target ? "fighting alongside " + target.GetPlayerName() : "fighting alongside you";
@@ -1461,7 +1481,8 @@ public class Companion : BaseUnityPlugin {
     // "take it home" on demand, rather than waiting for the pack to fill.
     bool HaulNow(Player speaker) {
         var me = Player.m_localPlayer;
-        if ((IsSweep || job == Job.Mule) && errand == Job.None && StartHaul()) return true;
+        if ((IsSweep || job == Job.Mule) && errand == Job.None &&
+            Needed(me, out var need, out var spot, out var said) && Detour(need, spot, said)) return true;
         if (!places.TryGetValue("home", out var home)) {
             Say("I know no home to take it to. Stand by a chest and say 'remember this as home'.");
             return true;
@@ -1903,37 +1924,92 @@ public class Companion : BaseUnityPlugin {
     }
     // Break off to mend, then come back to the same spot and carry on. Uses the same
     // errand slot as hauling, so only one detour is ever in flight.
-    bool StartMend(Skills.SkillType kind) {
-        if (errand != Job.None || !IsSweep || mendTried) return false;
-        var me = Player.m_localPlayer;
-        // The blunt tool from the pack, not whatever is in his hands: a snapped one
-        // has already been unequipped and GetCurrentWeapon answers with his fists.
-        var tool = BestTool(kind);
+    // ---- Detours ---------------------------------------------------------
+    //
+    // The errand slot holds the interrupted real job and nothing else. Detours hand off
+    // sideways to each other and never stack, because a detour is not a stored plan -
+    // it is a predicate on current world state. A queued detour is a stale one: by the
+    // time it popped, the pack might be empty and the axe mended. Re-deriving is
+    // smaller, and it makes losing or duplicating a detour structurally impossible.
+    static int Rank(Job kind) { return kind == Job.Haul ? 3 : kind == Job.Mend ? 1 : 0; }
+
+    // Everything he might break off to do, derived from the world alone.
+    bool Needed(Player me, out Job kind, out Vector3 where, out string line) {
+        kind = Job.None; where = Vector3.zero; line = null;
+        if (Loaded(me) && places.TryGetValue("home", out where)) {
+            kind = Job.Haul;
+            line = "My pack is full. I'll run this home and come back for the rest.";
+            return true;
+        }
+        // Mid-detour `job` is Haul or Mend, whose tool is None. Read the errand, or
+        // "unload at home, then mend at the bench beside it" can never be seen.
+        var need = ToolFor(errand != Job.None ? errand : job);
+        if (!Blunt(need)) return false;
+        var tool = BestTool(need);
         string name = tool != null ? Localization.instance.Localize(tool.m_shared.m_name) : "tool";
-        Vector3 where;
-        // Only a station that would actually take THIS tool is worth the walk. Picking
-        // the nearest usable one sent him to a forge with a stone axe, which the forge
-        // refuses - then straight back, forever.
         var station = tool == null ? null
             : StationsAround(me.transform.position, 60f).FirstOrDefault(s => CanRepair(tool, s));
-        if (station && Vector3.Distance(station.transform.position, me.transform.position) <= 5f) where = me.transform.position;
-        else if (station) where = station.transform.position;
+        if (station) where = station.transform.position;
         else if (campKnown) where = camp;
         else if (!places.TryGetValue("workbench", out where) && !places.TryGetValue("home", out where)) {
-            // Said once, not once per physics tick for the rest of the job.
-            if (Time.time - mendRefused > 60f) {
-                mendRefused = Time.time;
+            if (!mendRefused) {
+                mendRefused = true;   // said once per job, not fifty times a second
                 Say("My " + name + " is nearly spent and I know no bench to mend it at. Say 'learn the camp' in your base.");
             }
             return false;
         }
-        errand = job;
-        mendTried = true;   // one bench detour per job, or a refusal loops
-        job = Job.Mend;
-        destination = where;
-        sweepTarget = null; reachedAt = 0f;        Say("My " + name + " is nearly spent. I'll mend it and come back.");
+        kind = Job.Mend;
+        line = "My " + name + " is nearly spent. I'll mend it and come back.";
         return true;
     }
+
+    // The only way into, or between, detours. Writes the errand slot exactly once per
+    // chain: the first call stores the interrupted job, later hand-offs only re-aim.
+    bool Detour(Job kind, Vector3 where, string line) {
+        if (errand == Job.None) {
+            // Only a sweep or a mule run may be interrupted. Every other job reads
+            // `destination`, which a detour overwrites. This guard is what keeps it safe.
+            if (!IsSweep && job != Job.Mule) return false;
+            errand = job;
+        } else if (Rank(kind) <= Rank(job)) return false;   // hand-offs only go up
+        if (++detours > MaxDetours) { Abandon("I've been back and forth " + (detours - 1) + " times over this. It's beyond me for now."); return true; }
+        if (futile >= MaxFutile) { Abandon("Three trips and nothing to show for them. I'll stop."); return true; }
+        job = kind;
+        destination = where;
+        sweepTarget = null; reachedAt = 0f;
+        Fresh(Lane.Job);
+        if (line != null) Say(line);
+        return true;
+    }
+
+    // Ends every detour. `gained` is verified progress in the world - stacks actually
+    // moved, gear actually mended - never elapsed time and never merely arriving.
+    void AfterDetour(Player me, bool gained) {
+        futile = gained ? 0 : futile + 1;
+        var was = job;
+        job = Job.None;   // this detour is over, so the next is a hand-off, not a
+                          // nesting, and Rank must not compare against the finished one
+        if (Needed(me, out var kind, out var where, out var line)) {
+            // The same need still true at zero distance with nothing gained means the
+            // trip cannot help: full chests with piling off, a bench that will not serve.
+            if (kind == was && !gained) { Abandon("I came all this way and it changed nothing."); return; }
+            if (Detour(kind, where, line)) return;
+        }
+        job = Job.Resume; reachedAt = 0f;
+        Fresh(Lane.Job);
+    }
+
+    // A detour that fails takes the job with it, and says which - a dropped order should
+    // never be something the player has to infer from silence.
+    void Abandon(string why) {
+        var lost = errand;
+        if (lost == Job.None) { Halt(why); return; }
+        string what = JobWord(lost);
+        Halt(why + " " + char.ToUpperInvariant(what[0]) + what.Substring(1) + " is off.");
+    }
+    // One place where verified progress in the world is recorded.
+    void Progress() { collected++; futile = 0; }
+
     void Mend(Player player) {
         var standing = StationsAround(player.transform.position, 5f);
         if (standing.Count > 0) {
@@ -1943,7 +2019,7 @@ public class Companion : BaseUnityPlugin {
                 ? (trouble != null ? "I can't mend here — " + trouble + "." : "Nothing of mine needed mending after all.")
                 : "Mended " + mended + " of my own.";
             // A mend that interrupted a job goes back to it; a plain "repair" is done.
-            if (errand != Job.None) { Say(said + " Back to it."); ResumeSweep(player); }
+            if (errand != Job.None) { Say(said); AfterDetour(player, mended > 0); }
             else Halt(said);
             return;
         }
@@ -1959,26 +2035,6 @@ public class Companion : BaseUnityPlugin {
         if (Time.time - reachedAt > 8f)
             Stumble(station ? "bench unreachable" : "no bench where I went");
             Halt(station ? "I'm at the bench but can't get close enough to work." : "I came to mend, but there's no station here.");
-    }
-    void ResumeSweep(Player player) {
-        job = Job.Resume; reachedAt = 0f;    }
-    // A full pack pauses the sweep rather than ending it: run the load to the home
-    // chest, then walk back to the anchor and carry on. Deliberately does not go
-    // through Halt, which would forget the anchor, filter and skip list.
-    // Valheim's own pickup gives up on weight well before the last slot fills, so a
-    // haul has to trigger on either.
-    static bool Loaded(Player player) {
-        return !player.GetInventory().HaveEmptySlot() ||
-               player.GetInventory().GetTotalWeight() >= player.GetMaxCarryWeight() * 0.9f;
-    }
-    bool StartHaul() {
-        if (errand != Job.None || (!IsSweep && job != Job.Mule)) return false;
-        if (!places.TryGetValue("home", out var home)) return false;
-        errand = job;
-        job = Job.Haul;
-        destination = home;
-        sweepTarget = null; reachedAt = 0f;        Say("My pack is full. I'll run this home and come back for the rest.");
-        return true;
     }
     Component Probe(Job kind, Vector3 centre, string filter, HashSet<int> skip, Vector3 from) {
         switch (kind) {
@@ -2389,7 +2445,8 @@ public class Companion : BaseUnityPlugin {
         if (player.Pickup(drop.gameObject, autoequip: false)) { Skip(); collected++; return; }
         // Leave it unvisited: after a run home he should come back for this one.
         sweepTarget = null; reachedAt = 0f;
-        if (Loaded(player) && !StartHaul()) FinishSweep("My pack has no room left.");
+        if (Loaded(player) && !(Needed(player, out var need, out var spot, out var said) && Detour(need, spot, said)))
+            FinishSweep("My pack has no room left.");
     }
     // One tick of walking toward a point. Every job and the fight overlay share it,
     // so steering, jumping, sprinting and stuck detection behave the same everywhere.
@@ -2591,10 +2648,9 @@ public class Companion : BaseUnityPlugin {
         if (IsSweep && Time.time > sweepUntil) { FinishSweep("I have spent long enough at it."); return; }
         // Checked before picking a target: a full pack or a blunt tool means the next
         // thing to do is the errand, not another tree.
-        if ((IsSweep || job == Job.Mule) && errand == Job.None) {
-            if (Loaded(player) && StartHaul()) return;
-            if (Blunt(ToolFor(job)) && StartMend(ToolFor(job))) return;
-        }
+        // One question, asked in one place: is there anything he should break off to do?
+        if ((IsSweep || job == Job.Mule) && errand == Job.None &&
+            Needed(player, out var need, out var spot, out var said) && Detour(need, spot, said)) return;
         // Below the detours, so a full pack is emptied before he tries to pick up a
         // meal he has no room for, and never while he is part-way through an errand.
         if (errand == Job.None && job != Job.Deliver && job != Job.Grave && Peckish(player)) { TakeMorsel(player); return; }
