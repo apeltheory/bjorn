@@ -38,10 +38,33 @@ starting with `Bjorn, self test`.
 | 22 | "repair your stuff", "eat up" | Direct synonyms. Fixed `eat up` matching **turnip soup** via the `up` substring, and `bring me some wood` failing because `some` became part of the item name |
 | 23 | A private repo | `github.com/apeltheory/valheim-companion`, secrets and decompiled game source excluded |
 | 25 | Camp awareness across a multi-house base | `learn the camp` surveys via `Piece.GetAllPiecesInRadius`, saves centre and extent; guard patrols the real camp, mending finds a real bench |
-| 26 | Voice — he hears you, replies in text | Bridge and plugin plumbing done and tested; transcriber not yet chosen. See below |
+| 26 | Voice — he hears you, replies in text | Plumbing done and tested, then **parked** by decision. See below |
 | 24 | Ask follow-up questions, accept replies without his name | Ask-and-listen primitive: one player, 25 seconds, one answer, and the answer can only resolve the question asked — it cannot start a job |
 
-## Voice — listening, built as far as it can go without a transcriber
+## Voice — PARKED
+
+Decided against going further, 15 Sep. The plumbing is built, tested and dormant
+(`Listen = false`, polls nothing while off), so it costs nothing to leave in place and
+nothing to pick back up.
+
+**Why parked.** The only version worth having is push-to-talk, because always-on listening
+fails three ways at once: no voice-activity detection means chopped sentences or continuous
+transcription; a room mic hears Discord, game audio and everyone else; and "Bjorn" is a poor
+wake word — speech recognition renders it as Born, Byorn, Bjørn, B. John, all of which the
+exact prefix match drops silently.
+
+Push-to-talk fixes all three (the keypress *is* the wake signal) — but the key and mic have
+to be on the machine being played on, which is the PC, not the laptop running Bjorn. That
+means a client on the PC and binding the bridge past loopback. Real work, for a benefit that
+is real but narrow: commanding him without taking hands off the game, since opening Valheim
+chat means stopping.
+
+**To unpark:** fuzzy wake-word matching (worth doing on its own merits), a push-to-talk
+client on the PC, and a decision about exposing the bridge to the LAN. Latency to expect is
+2-4s for a direct command, 10-18s if it falls through to Claude — fine for "chop wood",
+useless for "look out".
+
+### What exists now
 
 Valheim has no voice chat of its own (checked: no VOIP class in 631 decompiled files), and
 tapping a third-party voice mod's decoded audio would mean Harmony-patching another mod's
