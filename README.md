@@ -1,8 +1,6 @@
 # Bjorn — Valheim companion
 
-Project folder: `/home/apel-xps/Work/valheim-companion`
-
-Bjorn runs a real Valheim client on this laptop using his own Steam account. You play on your PC. A C# BepInEx plugin controls his character, and a local Python service uses Anthropic to interpret natural-language orders and provide a grounded Viking personality.
+Bjorn runs a real Valheim client on a spare machine using its own Steam account. You play on your PC. A C# BepInEx plugin controls his character, and a local Python service uses Anthropic to interpret natural-language orders and provide a grounded Viking personality.
 
 ## Quick start
 
@@ -10,7 +8,7 @@ Bjorn runs a real Valheim client on this laptop using his own Steam account. You
 2. Open a terminal and start the planner:
 
    ```sh
-   /home/apel-xps/Work/valheim-companion/scripts/brain.sh
+   ./scripts/brain.sh
    ```
 
    Leave that terminal open. If it reports `Address already in use`, a service is already listening on port 8765; check the existing planner instead of starting another copy.
@@ -18,7 +16,7 @@ Bjorn runs a real Valheim client on this laptop using his own Steam account. You
 3. Open another terminal and launch the modded game:
 
    ```sh
-   /home/apel-xps/Work/valheim-companion/scripts/game.sh
+   ./scripts/game.sh
    ```
 
    **Use this launcher. Launching normally through Steam does not load this separate mod profile.** The launcher starts a 960×540 window; lower graphics quality further in Valheim's settings if needed.
@@ -406,7 +404,7 @@ Better Networking's package targets an earlier Valheim release. Its documentatio
 The key is already saved locally in `.env`. **Do not paste it into chat, logs, or handoff notes.** To enter or replace it without a text editor:
 
 ```sh
-python3 /home/apel-xps/Work/valheim-companion/scripts/set-key.py
+python3 scripts/set-key.py
 ```
 
 Paste with Ctrl+Shift+V, then press Enter. Input stays invisible. Restart the planner after changing the key or model.
@@ -463,14 +461,13 @@ Other than the in-game F8 toggle, edit configuration while the game is closed.
 | `.tools/` | Local SDK, ILSpy, downloaded packages, inspection output, build log |
 | `.env` and `runtime/bridge.token` | Secrets; do not disclose |
 
-The profile links game assets from `/home/apel-xps/.local/share/Steam/steamapps/common/Valheim`. It is **not a separate installation of Steam or a separate save-data sandbox**. Steam login and character saves use the normal desktop user's environment. Game updates affect the linked files and can require rebuilding or fixing mods.
+The profile links game assets from the Steam Valheim directory (by default `~/.local/share/Steam/steamapps/common/Valheim`; override with `VALHEIM_DIR`). It is **not a separate installation of Steam or a separate save-data sandbox**. Steam login and character saves use the normal desktop user's environment. Game updates affect the linked files and can require rebuilding or fixing mods.
 
 ## Build and checks
 
 From the project folder:
 
 ```sh
-cd /home/apel-xps/Work/valheim-companion
 ./scripts/build.sh
 python3 -m unittest discover -s tests -v
 python3 scripts/check-commands.py

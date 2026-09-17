@@ -10,7 +10,7 @@ One entry point for everything: `scripts/bjorn.sh`. Prefer it over calling
 the checks those scripts do not.
 
 ```sh
-cd /home/apel-xps/Work/valheim-companion
+cd /path/to/valheim-companion   # the repo root
 
 ./scripts/bjorn.sh status          # what is running, plugin version, last log line
 ./scripts/bjorn.sh start           # planner, then the game
