@@ -131,6 +131,8 @@ deliberate resets. Under review.
 | 32 | Answer off-topic questions in character | "Washington. A long row west, and I'd not fancy it." Correct answer, his voice, never breaks character |
 | 33 | Tend the furnace, smelt ore | `tend the smelter` walks a circuit of every smelter, kiln, blast furnace and windmill within 40 m: output out, coal in, ore in, repeat until a full round shifts nothing |
 | 34 | Bake in the Valheim wiki | Rejected as such. Recipes come from `ObjectDB` — the installed game's own data, exact for this version and any mods — and broader questions go to Claude. A wiki would be machinery to replace knowledge already present |
+| 37 | "He's too far to hear me" | Not a hearing problem. Shouts bypass `Talker` entirely — `Chat.SendText` routes them to every player on the server with no distance check — but they arrive with a null `go`, so he dropped them when the shouter wasn't loaded. He now reads the name and position off the chat message itself. `/s Bjorn, ...` reaches him anywhere on the map |
+| 36 | He could not walk to another player | `go to <name>`, `walk to <name>`, `find <name>`, `follow`/`stick with <name>`, `where is <name>`. Loaded players are live targets he can follow; anyone further off comes from `ZNet.GetPlayerList()`, which knows the whole server but only if they are sharing their position |
 | 35 | Ambiguous recipe names | "How do I craft a spear" names the four spears and waits, using the follow-up window |
 
 ## Fixed from the first play session

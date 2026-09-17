@@ -76,6 +76,8 @@ public class Companion : BaseUnityPlugin {
     float hurtAt;
     Vector3 fightFrom;     // Where a self-defence fight started, so he does not chase far.
     float threatScan, lastShout, grazeCheck, morselScan, lastBeg, morselAt, hungrySince, handsChecked;
+    float lastRetreat;   // Breaking off has its own cooldown: sharing the combat one meant
+                         // the line was swallowed by the callout he made seconds earlier.
     int begged;
     ItemDrop morsel;   // Food on the ground he is walking over to collect.
     ItemDrop salvage;  // Anything on the ground he is collecting while acting as a mule.
@@ -89,6 +91,9 @@ public class Companion : BaseUnityPlugin {
     float patrolRing, postUntil;
     Vector3 graveSpot;
     Vector3 dryGround;   // Last solid ground he stood on; the way out of deep water.
+    string goingTo;      // A person he is walking to, for the sake of saying so.
+    string remoteName;   // Who spoke, when the speaker is too far off to be loaded here.
+    Vector3 remotePos;   // Where they stood when they said it.
     bool graveKnown;
     Player deliverTo;      // Who is owed a delivery once the fetching is done.
     string deliverFilter;
@@ -144,7 +149,11 @@ public class Companion : BaseUnityPlugin {
         guardRadius = Config.Bind("Bot", "GuardRadius", 30f, "How far from a camp's centre counts as inside it while on guard, in metres (8-120).");
         pileOver = Config.Bind("Bot", "PileWhenNoChest", true, "On a run home, leave anything the chest cannot take on the ground rather than stopping the job. Dropped items persist in Valheim.");
         defendSelf = Config.Bind("Bot", "DefendSelf", true, "Fight back at anything hostile that comes close while doing other work. Guard duty ignores this and always fights.");
-        tokenFile = Config.Bind("Bridge", "TokenFile", "/home/apel-xps/Work/valheim-companion/runtime/bridge.token", "Local bridge token file.");
+        // Derived from where BepInEx actually is, so a checkout anywhere works. An
+        // existing config file keeps whatever value it already holds; this is only the
+        // default written on a first run.
+        string defaultToken = Path.GetFullPath(Path.Combine(Paths.GameRootPath, "..", "bridge.token"));
+        tokenFile = Config.Bind("Bridge", "TokenFile", defaultToken, "Local bridge token file.");
         listen = Config.Bind("Bridge", "Listen", false, "Poll the bridge for spoken orders. Leave off unless something is transcribing speech into it.");
         LoadPlaces();
         LoadCamp();
@@ -183,7 +192,7 @@ public class Companion : BaseUnityPlugin {
         furnace = null; lastRound = 0;
         asked = null; choices = null; onAnswer = null;
         skippedDrops.Clear(); unreachable.Clear(); skippedDoors.Clear();
-        deliverTo = null; deliverFilter = null; morsel = null;
+        deliverTo = null; deliverFilter = null; morsel = null; goingTo = null;
         // piles IS cleared here. No live chain runs through Halt - GleanOrFinish,
         // AfterDetour and Unload all change job without it, and FinishSweep's only
         // follow-on goes through Begin. Keeping them meant Sweep, which probes BEFORE
@@ -219,7 +228,9 @@ public class Companion : BaseUnityPlugin {
     // it cannot start an arbitrary job. Anything that does not parse as an answer is
     // ignored and the window stays open, so ordinary chat is never hijacked.
     void AskFor(Player who, string question, string[] options, Action<string> answer) {
-        if (!who) return;
+        // No body to take an answer from: ask anyway so the choices are heard, but never
+        // arm the follow-up window - a null `asked` would match every later message.
+        if (!who) { Say(question + " Come closer and tell me which."); return; }
         asked = who; choices = options; onAnswer = answer;
         askedUntil = Time.unscaledTime + 25f;
         Say(question);
@@ -361,7 +372,8 @@ public class Companion : BaseUnityPlugin {
                               " filter=" + (sweepFilter ?? "none"));
             report.AppendLine("body   : health " + Mathf.RoundToInt(me.GetHealth()) + "/" + Mathf.RoundToInt(me.GetMaxHealth()) +
                               ", stamina " + Mathf.RoundToInt(me.GetStamina()) + "/" + Mathf.RoundToInt(me.GetMaxStamina()) +
-                              ", foods " + me.GetFoods().Count + "/3, swimming=" + me.IsSwimming());
+                              ", foods " + me.GetFoods().Count + "/3");
+            report.AppendLine("stance : " + Body(me) + ", moving at " + me.GetVelocity().magnitude.ToString("0.00"));
             var held = Held(me);
             report.AppendLine("hands  : " + (held != null
                 ? Localization.instance.Localize(held.m_shared.m_name) + " " + held.m_durability.ToString("0") + "/" + held.GetMaxDurability().ToString("0")
@@ -399,6 +411,27 @@ public class Companion : BaseUnityPlugin {
     // moments beats a snapshot on a timer, which would mostly catch him walking along
     // quite happily.
     readonly Dictionary<string, float> stumbles = new Dictionary<string, float>();
+    // Twelve clear probes and no movement means nothing is in his way - it is his own
+    // body refusing the input. SetControls silently routes movement into a cart or boat
+    // when a doodad is being steered, and skips its own auto-detach in that one case,
+    // so a stumble report that names only the terrain cannot tell you which happened.
+    static string Body(Player me) {
+        var states = new List<string>();
+        if (me.IsAttached()) states.Add("attached");
+        if (me.GetDoodadController() != null) states.Add("steering something");
+        if (me.InBed()) states.Add("in bed");
+        if (me.InEmote()) states.Add("emoting");
+        if (me.InAttack()) states.Add("mid-swing");
+        if (me.IsStaggering()) states.Add("staggered");
+        if (me.InCutscene()) states.Add("cutscene");
+        if (me.IsTeleporting()) states.Add("teleporting");
+        if (me.InPlaceMode()) states.Add("build mode");
+        if (me.IsEncumbered()) states.Add("encumbered");
+        if (me.IsCrouching()) states.Add("crouched");
+        if (me.IsSwimming()) states.Add("swimming");
+        if (!me.IsOnGround()) states.Add("off ground");
+        return states.Count == 0 ? "free" : string.Join("+", states);
+    }
     void Stumble(string what) {
         var me = Player.m_localPlayer;
         Vector3 at = me ? me.transform.position : Vector3.zero;
@@ -416,7 +449,9 @@ public class Companion : BaseUnityPlugin {
             facing.y = 0f;
             if (facing.sqrMagnitude < 0.01f) facing = Vector3.forward;
             var held = Held(me);
-            line += " | hands=" + (held != null ? Localization.instance.Localize(held.m_shared.m_name) : "EMPTY") +
+            line += " | body=" + Body(me) +
+                    " | speed=" + me.GetVelocity().magnitude.ToString("0.00") +
+                    " | hands=" + (held != null ? Localization.instance.Localize(held.m_shared.m_name) : "EMPTY") +
                     " | probes=" + Probes(at, facing.normalized,
                         LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain"));
         }
@@ -424,7 +459,7 @@ public class Companion : BaseUnityPlugin {
         catch { }
         Logger.LogInfo(line);
     }
-    internal void Receive(GameObject source, long senderId, string text) {
+    internal void Receive(GameObject source, long senderId, Vector3 spokenAt, string spokenBy, string text) {
         var me = Player.m_localPlayer;
         if (text == null) return;
         var prefix = botName.Value;
@@ -451,10 +486,15 @@ public class Companion : BaseUnityPlugin {
             Logger.LogInfo("Addressed order ignored: sent from Bjorn's own character.");
             return;
         }
-        if (!speaker) {
-            Logger.LogInfo("Addressed order ignored: speaking player is not loaded nearby.");
+        // A shout reaches him from anywhere on the map, so an unloaded speaker is normal
+        // rather than an error. The message carried their name and where they stood;
+        // that is enough for every order that does not need to track a moving body.
+        if (!speaker && string.IsNullOrEmpty(spokenBy)) {
+            Logger.LogInfo("Addressed order ignored: no speaking player and no name on the message.");
             return;
         }
+        remoteName = speaker ? null : spokenBy;
+        remotePos = spokenAt;
         Dispatch(speaker, text, addressed);
     }
     // Spoken orders arrive here from the bridge. They take the identical path to
@@ -580,8 +620,13 @@ public class Companion : BaseUnityPlugin {
         if (Prefixed(simple, order, "tend ", out rest) && Tend(rest)) return;
         if (Prefixed(simple, order, "guard ", out rest) && Guard(rest)) return;
         if (Prefixed(simple, order, "patrol ", out rest) && Guard(rest)) return;
-        if (Prefixed(simple, order, "go to ", out rest) && GoToPlace(rest)) return;
-        if (Prefixed(simple, order, "head to ", out rest) && GoToPlace(rest)) return;
+        if (Prefixed(simple, order, "go to ", out rest) && (GoToPlace(rest) || GoToPerson(rest))) return;
+        if (Prefixed(simple, order, "head to ", out rest) && (GoToPlace(rest) || GoToPerson(rest))) return;
+        if (Prefixed(simple, order, "walk to ", out rest) && (GoToPerson(rest) || GoToPlace(rest))) return;
+        if (Prefixed(simple, order, "go find ", out rest) && GoToPerson(rest)) return;
+        if (Prefixed(simple, order, "where is ", out rest) && WherePerson(rest)) return;
+        if (Prefixed(simple, order, "stick with ", out rest) && FollowPerson(rest)) return;
+        if (Prefixed(simple, order, "follow ", out rest) && FollowPerson(rest)) return;
         if (Prefixed(simple, order, "forget ", out rest) && ForgetPlace(rest)) return;
         if (Prefixed(simple, order, "pick up ", out rest) && Fetch(rest)) return;
         if (Prefixed(simple, order, "gather ", out rest) && Fetch(rest)) return;
@@ -594,7 +639,7 @@ public class Companion : BaseUnityPlugin {
         if (Prefixed(simple, order, "hand me ", out rest) && Bring(speaker, rest)) return;
         if (Prefixed(simple, order, "get me ", out rest) && Bring(speaker, rest)) return;
         if (Prefixed(simple, order, "bring ", out rest) && Bring(speaker, rest)) return;
-        if (Prefixed(simple, order, "find ", out rest) && Bring(speaker, rest)) return;
+        if (Prefixed(simple, order, "find ", out rest) && (GoToPerson(rest) || Bring(speaker, rest))) return;
         if (Prefixed(simple, order, "give me ", out rest) && Bring(speaker, rest)) return;
         if (Prefixed(simple, order, "toss me ", out rest) && Bring(speaker, rest)) return;
         if (Prefixed(simple, order, "throw me ", out rest) && Bring(speaker, rest)) return;
@@ -615,11 +660,111 @@ public class Companion : BaseUnityPlugin {
         Logger.LogInfo("No direct command matched; asking the planner to read it.");
         StartCoroutine(Decide(order, speaker, ++generation));
     }
-    void Follow(Player speaker) { Begin(Job.Follow); target = speaker; Logger.LogInfo("Follow target set."); Say("I'll follow your lead."); }
-    void Come(Player speaker) { Begin(Job.Come); target = speaker; Say("I'm coming to you."); }
+    void Follow(Player speaker, string who = null) {
+        // Following needs a body to track. From across the map, walking to where they
+        // called from is the closest honest thing he can do.
+        if (!speaker) { if (!GoToRemote()) Absent(null, "follow you"); return; }
+        Begin(Job.Follow); target = speaker; Logger.LogInfo("Follow target set."); Say(who != null ? "I'll keep with " + who + "." : "I'll follow your lead.");
+    }
+    void Come(Player speaker, string who = null) {
+        if (!speaker) { if (!GoToRemote()) Absent(null, "come to you"); return; }
+        Begin(Job.Come); target = speaker; Say(who != null ? "On my way to " + who + "." : "I'm coming to you.");
+    }
+
+    // Other people on the server, by name. Someone loaded nearby is a live target he can
+    // follow; anyone further off is only a point on the map, and only if they are
+    // sharing their position at all.
+    Player LoadedPlayer(string wanted) {
+        var me = Player.m_localPlayer;
+        return Player.GetAllPlayers().FirstOrDefault(other => other && other != me &&
+            WordMatches(other.GetPlayerName(), wanted));
+    }
+    bool GoToPerson(string raw) {
+        var me = Player.m_localPlayer;
+        string wanted = Bare(raw);
+        if (wanted == null || !me) return false;
+        var near = LoadedPlayer(wanted);
+        if (near) { Come(near, near.GetPlayerName()); return true; }
+        var everyone = ZNet.instance != null ? ZNet.instance.GetPlayerList() : null;
+        if (everyone == null) return false;
+        foreach (var who in everyone) {
+            if (string.IsNullOrEmpty(who.m_name) || who.m_name == me.GetPlayerName()) continue;
+            if (!WordMatches(who.m_name, wanted)) continue;
+            if (!who.m_publicPosition) {
+                Say(who.m_name + " isn't sharing where they are. I'd be wandering blind.");
+                return true;
+            }
+            Vector3 gap = who.m_position - me.transform.position;
+            gap.y = 0f;
+            Begin(Job.Home);
+            destination = who.m_position;
+            goingTo = who.m_name;
+            Say("Setting off for " + who.m_name + " — " + Mathf.RoundToInt(gap.magnitude) + " paces " + Compass(gap) + ".");
+            return true;
+        }
+        return false;
+    }
+    // Where the speaker called from. No map sharing needed - the shout itself carried
+    // the position - but it is a snapshot, not a track, so say so.
+    bool GoToRemote() {
+        var me = Player.m_localPlayer;
+        if (remoteName == null || !me) return false;
+        var near = LoadedPlayer(remoteName);
+        if (near) { Come(near, near.GetPlayerName()); return true; }
+        Vector3 gap = remotePos - me.transform.position;
+        gap.y = 0f;
+        Begin(Job.Home);
+        destination = remotePos;
+        goingTo = remoteName;
+        Say("On my way, " + remoteName + " \u2014 " + Mathf.RoundToInt(gap.magnitude) + " paces " + Compass(gap) +
+            ". Shout again if you move.");
+        return true;
+    }
+    // Orders that need a body to walk to or hand things to cannot be served from across
+    // the map. Refuse by name rather than in silence.
+    bool Absent(Player speaker, string what) {
+        if (speaker) return false;
+        Say(remoteName != null
+            ? "You're a long way off, " + remoteName + ". I can't " + what + " from here \u2014 get closer and say it again."
+            : "I hear you, but I cannot see who's speaking.");
+        return true;
+    }
+    bool WherePerson(string raw) {
+        var me = Player.m_localPlayer;
+        string wanted = Bare(raw);
+        if (wanted == null || !me) return false;
+        var near = LoadedPlayer(wanted);
+        if (near) {
+            Vector3 gap = near.transform.position - me.transform.position;
+            gap.y = 0f;
+            Say(near.GetPlayerName() + " is " + Mathf.RoundToInt(gap.magnitude) + " paces " + Compass(gap) + " of me.");
+            return true;
+        }
+        var everyone = ZNet.instance != null ? ZNet.instance.GetPlayerList() : null;
+        if (everyone == null) return false;
+        foreach (var who in everyone) {
+            if (string.IsNullOrEmpty(who.m_name) || who.m_name == me.GetPlayerName()) continue;
+            if (!WordMatches(who.m_name, wanted)) continue;
+            if (!who.m_publicPosition) { Say(who.m_name + " isn't sharing where they are."); return true; }
+            Vector3 gap = who.m_position - me.transform.position;
+            gap.y = 0f;
+            Say(who.m_name + " is a long way off \u2014 " + Mathf.RoundToInt(gap.magnitude) + " paces " + Compass(gap) + ".");
+            return true;
+        }
+        return false;
+    }
+    bool FollowPerson(string raw) {
+        string wanted = Bare(raw);
+        if (wanted == null) return false;
+        var near = LoadedPlayer(wanted);
+        if (!near) return false;
+        Follow(near, near.GetPlayerName());
+        return true;
+    }
     // Sticks with you and fights what you are fighting, bosses first, and will not
     // quit the job when hurt - he backs off, heals, and closes again.
     void Escort(Player speaker) {
+        if (Absent(speaker, "fight at your side")) return;
         Begin(Job.Escort);
         target = speaker;
         GearUp(Player.m_localPlayer);
@@ -727,7 +872,7 @@ public class Companion : BaseUnityPlugin {
             case Job.Come: return "on my way to you";
             case Job.Escort: return target ? "fighting alongside " + target.GetPlayerName() : "fighting alongside you";
             case Job.Mule: return "carrying for you, " + muled + " picked up so far";
-            case Job.Home: return "walking home";
+            case Job.Home: return goingTo != null ? "on my way to " + goingTo : "walking home";
             case Job.Bed: return "walking to my bed";
             case Job.Fetch: return "gathering what has fallen";
             case Job.Harvest: return "foraging";
@@ -1604,6 +1749,7 @@ public class Companion : BaseUnityPlugin {
         if (FetchDrop(player, ref salvage, ref salvageAt)) muled++;
     }
     void Mule(Player speaker) {
+        if (Absent(speaker, "carry for you")) return;
         Begin(Job.Mule);
         target = speaker;
         muled = 0; hauls = 0;
@@ -1626,9 +1772,10 @@ public class Companion : BaseUnityPlugin {
         }
         Begin(Job.Haul);
         destination = home;
-        // Come back to whoever asked once the pack is empty.
-        errand = Job.Come; target = speaker;
-        Say("Taking it home.");
+        // Come back to whoever asked once the pack is empty - but only if there is a
+        // body to come back to. A shouted order from across the map has none.
+        if (speaker) { errand = Job.Come; target = speaker; }
+        Say(speaker ? "Taking it home." : "Taking it home. I'll wait there for you.");
         return true;
     }
 
@@ -1658,7 +1805,8 @@ public class Companion : BaseUnityPlugin {
     bool Bring(Player speaker, string requested) {
         var me = Player.m_localPlayer;
         string asked = Bare(requested);
-        if (asked == null || !speaker) return false;
+        if (asked == null) return false;
+        if (Absent(speaker, "bring you anything")) return true;
         // Split any leading count off before matching: "10 wood" must still find wood.
         // The count is carried through to the hand-over so he gives you what you asked.
         string filter = asked;
@@ -2359,6 +2507,9 @@ public class Companion : BaseUnityPlugin {
             switch (decision.action) {
                 case "follow": Follow(speaker); break;
                 case "come": Come(speaker); break;
+                case "goto_player": if (!GoToPerson(item)) Say("I know no one here by that name."); break;
+                case "follow_player": if (!FollowPerson(item)) Say("I cannot see them from here."); break;
+                case "where_player": if (!WherePerson(item)) Say("I know no one here by that name."); break;
                 case "escort": Escort(speaker); break;
                 case "mule": Mule(speaker); break;
                 case "haul": HaulNow(speaker); break;
@@ -2666,7 +2817,18 @@ public class Companion : BaseUnityPlugin {
         int mask = LayerMask.GetMask("Default", "static_solid", "Default_small", "piece", "terrain");
         bool jump = Time.time >= jumpUntil && CanJumpForward(player.transform.position, direction, mask);
         if (jump) jumpUntil = Time.time + 1.2f;
-        if (Vector3.Distance(s.previous, player.transform.position) < 0.01f) s.stuckTime += Time.fixedDeltaTime; else s.stuckTime = 0f;
+        // Let go of whatever is holding him before blaming the ground. SetControls breaks
+        // a bed or an emote by itself, but skips that exact branch while a doodad is
+        // being steered - hold a cart and every order below is silently swallowed.
+        if (player.GetDoodadController() != null) player.StopDoodadControl();
+        else if (player.IsAttached()) player.AttachStop();
+        // A body that cannot move yet is not a body that is wedged. Counting these as
+        // stuck time turns an ordinary stagger or a loading screen into an abandoned job.
+        if (player.IsTeleporting() || player.InCutscene() || player.IsStaggering() || player.InAttack()) {
+            s.previous = player.transform.position;
+            s.stuckTime = 0f;
+        }
+        else if (Vector3.Distance(s.previous, player.transform.position) < 0.01f) s.stuckTime += Time.fixedDeltaTime; else s.stuckTime = 0f;
         s.previous = player.transform.position;
         if (s.stuckTime > 3) return Step.Stuck;
         // Feed the real player controller so sprint and jump are handled like
@@ -2759,7 +2921,11 @@ public class Companion : BaseUnityPlugin {
                Vector3.Distance(hurtBy.transform.position, player.transform.position) < 25f;
     }
     void Flee(Player player) {
-        if (Time.time - lastShout > 8f) { lastShout = Time.time; Say("I'm hurt. Falling back — finish it without me."); }
+        // Always logged, never throttled - whether he actually ran is the first thing
+        // worth knowing after he dies, and it must not depend on a chat cooldown.
+        Logger.LogInfo("Falling back from " + (hurtBy ? Localization.instance.Localize(hurtBy.m_name) : "something") +
+                       " at " + Mathf.RoundToInt(player.GetHealth()) + "/" + Mathf.RoundToInt(player.GetMaxHealth()) + " health.");
+        if (Time.time - lastRetreat > 8f) { lastRetreat = Time.time; Say("I'm hurt. Falling back — finish it without me."); }
         Vector3 away = player.transform.position - hurtBy.transform.position;
         away.y = 0;
         if (away.sqrMagnitude < 0.0001f) away = player.transform.forward;
@@ -2824,7 +2990,7 @@ public class Companion : BaseUnityPlugin {
         // halted in deep water floats there at that stamina until someone walks to the
         // machine - no in-game order can recover him.
         if (player.IsSwimming()) {
-            if (Time.time - lastShout > 8f) { lastShout = Time.time; Say("I'm out of my depth. Making for shore."); }
+            if (Time.time - lastRetreat > 8f) { lastRetreat = Time.time; Say("I'm out of my depth. Making for shore."); }
             if (dryGround != Vector3.zero) StepToward(Lane.Flee, player, dryGround, 2.5f);
             return;
         }
@@ -3108,7 +3274,12 @@ public class Companion : BaseUnityPlugin {
     }
     [HarmonyPatch(typeof(Chat), "OnNewChatMessage")]
     class Messages {
-        static void Postfix(GameObject go, long senderID, string text) { Instance?.Receive(go, senderID, text); }
+        // Shouts arrive with a null `go` and are sent to every player on the server with
+        // no distance check at all, so `pos` and `sender` are the only things that say
+        // who spoke and from where. Parameter names must match the original's.
+        static void Postfix(GameObject go, long senderID, Vector3 pos, Talker.Type type, UserInfo sender, string text) {
+            Instance?.Receive(go, senderID, pos, sender != null ? sender.Name : null, text);
+        }
     }
 }
 }
