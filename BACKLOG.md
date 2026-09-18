@@ -58,9 +58,25 @@ the neighbours that used to need a paragraph of prompt — `escort` against `fig
 `pile` against `drop_all`, `bring` against `withdraw`, `recipe` against `craft`.
 
 The item reader is the part most likely to be wrong in play. It is pure Python with
-no model behind it, so every phrasing it has not met is a possible miss; `tests/test_brain.py`
-holds the ones it has. A miss shows up as an empty item, and for anything that empties
-a chest or a pack an empty item makes him ask rather than act.
+no model behind it, so every phrasing it has not met is a possible miss; the corpus in
+`tests/fixtures/jev_orders.json` holds the ones it has. A miss shows up as an empty item,
+and for anything that empties a chest or a pack an empty item makes him ask rather than act.
+
+**Rehearsing without a key.** `scripts/fake-jev.py` stands in for the API and holds the
+planner to the published request contract; `scripts/rehearse.py` runs the corpus through a
+real planner against it. Writing that harness caught three real defects that source review
+had missed:
+
+1. Junk items were sent to the twenty-five actions the plugin dispatches without ever
+   reading `item` — harmless for `escort`, but `fight` and `harvest` do read it, so he
+   would have answered *I see no there's a troll on us, deal with it to fight*.
+2. Whole clauses were accepted as item names. Anything past five words is now treated as
+   the reader having failed, which is safer than a filter that matches nothing.
+3. The talk path is two calls back to back, Jev then Anthropic, and at the old timeouts
+   could take 20 seconds against a plugin that abandons the request at 15. He would have
+   given up on answers that were on their way. The budgets are now 5 and 8.
+
+The third is the kind of thing only a rehearsal finds: every unit test passed throughout.
 
 ## Voice — PARKED
 

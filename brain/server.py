@@ -81,8 +81,24 @@ ACTION_CRITERIA = {
 ACTIONS = frozenset(ACTION_CRITERIA)
 
 # Emptying a chest or a pack by mistake is the one error that loses real work, so
-# these need a clear pick and, when the speaker named something, an item to go on.
+# these need a clear pick before they run at all.
 DESTRUCTIVE = {'deposit', 'withdraw', 'drop', 'drop_all', 'pile'}
+# The actions the plugin runs without reading `item` at all. Sending one anyway is
+# noise at best, and the plugin answers "I see no <junk> to fight" at worst, so the
+# item is dropped for these rather than passed along. Mirrors the dispatch switch in
+# Companion.cs, and `test_argless_mirrors_the_plugin` reads that switch to say so.
+ARGLESS = {
+    'follow', 'come', 'escort', 'mule', 'haul', 'stay', 'inventory', 'status', 'where', 'scan',
+    'self_test', 'survey', 'camp', 'places', 'claim_bed', 'go_to_bed', 'chop', 'mine', 'drop_all',
+    'pile', 'repair', 'feed_fire', 'open_door', 'close_door', 'chat',
+}
+
+# The plugin abandons a /decide request after 15 seconds, and the talk path is two
+# calls back to back, so their timeouts have to fit inside that with room to spare.
+# A slow answer he waits for beats a right answer that arrives after he gave up.
+JEV_TIMEOUT = 5
+TALK_TIMEOUT = 8
+PLAN_TIMEOUT = 12  # The Claude planner is alone on the wire, so it keeps the old budget.
 
 # The planner Claude reads when there is no Jev key. Unchanged from before
 # the port: it decides and speaks in one call.
@@ -228,6 +244,7 @@ VERBS = {
     'chop', 'fell', 'cut', 'mine', 'dig', 'break', 'fight', 'attack', 'kill', 'slay', 'defend',
     'guard', 'patrol', 'watch', 'remember', 'mark', 'call', 'name', 'open', 'close', 'shut', 'feed',
     'look', 'scan', 'report', 'tell', 'show', 'have', 'sleep', 'rest', 'survey', 'learn', 'help',
+    'empty', 'keep', 'unload', 'deliver', 'hunt', 'search',
 }
 # Dropped from the left as long as they lead. "and" survives in the middle, so
 # "wood and stone" stays whole.
@@ -238,16 +255,20 @@ FILLER = {
     'here', 'there', 'this', 'that', 'those', 'these', 'please', 'just', 'what', 'whats',
     "what's", 'where', "where's", 'wheres', 'how', "how's", 'which', 'do', 'does', 'did', 'is',
     'are', 'was', 'can', 'could', 'will', 'would', 'should', 'much', 'many', 'been', 'got', 'be',
+    'something', 'anything', 'everything',
 }
 # A whole phrase that means "everything", which the contract spells as no item.
 NOTHING = {
     '', 'all', 'everything', 'it', 'that', 'this', 'them', 'stuff', 'things', 'thing', 'gear',
     'kit', 'something', 'anything', 'us', 'me', 'yourself', 'your gear', 'your stuff',
-    'the lot', 'lot',
+    'the lot', 'lot', 'haul', 'load', 'loot', 'goods', 'materials', 'mats', 'the rest', 'rest',
 }
 # Trailing words that hang off a question rather than naming anything.
 TRAIL = {'cost', 'costs', 'need', 'needs', 'take', 'takes', 'require', 'requires', 'made', 'of', 'for',
          'please', 'then', 'now', 'left', 'there', 'away', 'up', 'down', 'out', 'over', 'back', 'off', 'in'}
+# Past this many words it is a sentence, not the name of a thing. "wood, stone and
+# flint" is a real answer; "troll on us, deal with it" is the reader giving up.
+MAX_ITEM_WORDS = 5
 ADDRESS = re.compile(r'^\s*bjorn\s*[,:]?\s*', re.IGNORECASE)
 # "take the wood out of the chest" names wood, not a chest. The place an order
 # acts on is already decided by the action, so a trailing phrase naming it goes.
@@ -278,6 +299,8 @@ def extract_item(message):
     while kept and kept[-1].lower().strip('.,!?;:"\'') in TRAIL:
         kept.pop()
     item = ' '.join(kept).strip(' ,.!?;:')
+    if len(item.split()) > MAX_ITEM_WORDS:
+        return ''
     return '' if item.lower() in NOTHING else item[:120]
 
 
@@ -329,7 +352,7 @@ class Planner:
         request = urllib.request.Request(self.jev_url, data=json.dumps(body).encode(),
             headers={'Content-Type': 'application/json', 'Accept': 'application/json',
                      'Authorization': 'Bearer ' + self.jev_key})
-        with urllib.request.urlopen(request, timeout=8) as response:
+        with urllib.request.urlopen(request, timeout=JEV_TIMEOUT) as response:
             answers = json.load(response).get('answers') or {}
         # Every default here fails towards asking rather than acting: no action is
         # talk, no confidence is below any floor, and an unreported `named` is read
@@ -348,7 +371,7 @@ class Planner:
             data=json.dumps(body).encode(), headers={'content-type': 'application/json',
             'x-api-key': self.key, 'anthropic-version': '2023-06-01'})
         try:
-            with urllib.request.urlopen(request, timeout=12) as response:
+            with urllib.request.urlopen(request, timeout=TALK_TIMEOUT) as response:
                 result = json.load(response)
             text = ''.join(part.get('text', '') for part in result['content'] if part['type'] == 'text').strip()
         except Exception:
@@ -364,7 +387,7 @@ class Planner:
         request = urllib.request.Request('https://api.anthropic.com/v1/messages',
             data=json.dumps(body).encode(), headers={'content-type': 'application/json',
             'x-api-key': self.key, 'anthropic-version': '2023-06-01'})
-        with urllib.request.urlopen(request, timeout=12) as response:
+        with urllib.request.urlopen(request, timeout=PLAN_TIMEOUT) as response:
             result = json.load(response)
         text = ''.join(part.get('text', '') for part in result['content'] if part['type'] == 'text').strip()
         if text.startswith('```'):
@@ -388,12 +411,14 @@ class Planner:
         action, confidence, named, tone = self.ask_jev(message, state)
         if action not in ACTIONS or confidence < self.floor:
             action = 'chat'
-        item = extract_item(message)
+        item = '' if action in ARGLESS else extract_item(message)
         if action in DESTRUCTIVE:
             # An empty item means everything, and that is how a whole chest gets
             # emptied by mistake. If he was told to be particular but nothing can
-            # be read off the sentence, he asks rather than guesses.
-            if confidence < 0.6 or (named >= 0.5 and not item):
+            # be read off the sentence, he asks rather than guesses. drop_all and
+            # pile take everything by definition, so only the pick is checked there.
+            unreadable = action not in ARGLESS and named >= 0.5 and not item
+            if confidence < 0.6 or unreadable:
                 return validate({'action': 'chat', 'item': '', 'reply': 'Name what you want moved. I will not empty the lot on a guess.'})
         if action == 'chat':
             return validate({'action': 'chat', 'item': '', 'reply': self.talk(message, state, tone)})

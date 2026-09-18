@@ -400,6 +400,32 @@ contract published in TypeSafe's official Python SDK, and it is dormant until a 
 exists: with `TYPESAFE_API_KEY` blank the planner is byte-for-byte the Claude one it
 has always been.
 
+### Rehearsing it without a key
+
+`scripts/fake-jev.py` stands in for `api.typesafe.ai`. It cannot imitate Jev's
+judgement, so it does not try: the answers come from a corpus in
+`tests/fixtures/jev_orders.json`, where each order carries the answer Jev is
+*imagined* to give and the decision that should fall out of it. What it does do is
+hold the planner to the published contract — a request missing `state`, or a choice
+with no criteria, or more than 255 of them, comes back 422 exactly as the real API
+would, so a malformed request fails here rather than on the first live call.
+
+```sh
+python3 scripts/rehearse.py          # every order, with what he decided and said
+python3 scripts/rehearse.py --quiet  # failures and the tally only
+```
+
+It drives a real `Planner` over real HTTP and exits non-zero on any surprise, so it
+runs inside the test suite as well. Three real bugs came out of writing it: junk
+items were being sent to the twenty-five actions the plugin runs without reading
+`item`; whole clauses were being accepted as item names, which would have had him
+answer *I see no there's a troll on us, deal with it to fight*; and the two-call
+talk path could take 20 seconds against a plugin that gives up at 15.
+
+When a key does arrive, record the real answers and replace each `jev` block in the
+corpus. Anything that then fails is a genuine disagreement between the model and
+the planner, which is the thing worth finding.
+
 Item, creature and recipe names are matched with case, spaces and punctuation
 ignored, against the localized name, the raw `$item_torch` token, and the prefab
 name — so `torch`, `Torch`, `wood arrows` and `WoodArrow` all match. A failed lookup
@@ -422,7 +448,7 @@ Status recorded September 15, 2026:
 | Better Networking | tibijczyk fork 2.3.4 installed; restart and compatibility check pending |
 | Installed Valheim at initial test | l-1.0.12, network version 40, Steam build 25253764 |
 | Anthropic planner | Configured locally; API and live bridge requests succeeded |
-| Jev planner | Code complete, **never run against the live API**: no early-access key yet |
+| Jev planner | Code complete and rehearsed against a contract-checking stand-in; **never run against the live API**, no early-access key yet |
 
 **Verified:** Bjorn 0.1.1 loaded and joined the friend's server with matching network versions. Six Python tests passed. The bridge rejected an invalid token and accepted an authenticated command. A natural-language request through the running planner received an Anthropic response.
 
@@ -483,7 +509,10 @@ Other than the in-game F8 toggle, edit configuration while the game is closed.
 | `plugin/Companion.cs` | Chat hooks, controls, jobs, item and station actions, F8 toggle, bridge calls |
 | `plugin/Bjorn.csproj` | C# project referencing installed game assemblies |
 | `brain/server.py` | Python standard-library HTTP bridge, Jev action planner, and Anthropic voice |
-| `tests/test_brain.py` | Offline command, validation, item reading, both API contracts, and call-cap tests |
+| `tests/test_brain.py` | Offline command, validation, item reading, both API contracts, call caps, and the plugin dispatch contract |
+| `tests/fixtures/jev_orders.json` | The order corpus: what Jev is imagined to answer, and where each order should land |
+| `scripts/fake-jev.py` | Stand-in for `api.typesafe.ai`; enforces the request contract, serves fixture answers |
+| `scripts/rehearse.py` | Run the corpus through a real planner against the stand-in |
 | `scripts/build.sh` | Compile the plugin |
 | `scripts/prepare.py` | Stage game symlinks, BepInEx, and compiled Bjorn plugin |
 | `scripts/game.sh` | Launch the modded client |
@@ -537,6 +566,12 @@ For a direct API check (uses one small paid request against whichever planner is
 
 ```sh
 python3 scripts/check-api.py
+```
+
+To exercise the Jev path with no key and no spend:
+
+```sh
+python3 scripts/rehearse.py
 ```
 
 ## Next gameplay test

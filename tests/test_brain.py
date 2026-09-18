@@ -1,8 +1,14 @@
+import importlib.util
 import json
 import os
+import re
 import unittest
+from pathlib import Path
 from unittest.mock import patch
-from brain.server import ACTIONS, ACTION_CRITERIA, Heard, Planner, extract_item, offline, validate
+from brain.server import (ACTIONS, ACTION_CRITERIA, ARGLESS, JEV_TIMEOUT, PLAN_TIMEOUT, TALK_TIMEOUT,
+                          Heard, Planner, extract_item, offline, validate)
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def jev_reply(action, confidence=0.95, named=0.9, tone='order'):
@@ -119,6 +125,14 @@ class ItemTests(unittest.TestCase):
                               ('stash the wood away', 'wood'), ('drop it on the floor', '')]:
             self.assertEqual(extract_item(message), item)
 
+    def test_a_clause_is_not_a_name(self):
+        # Past a few words the reader has failed, and a junk filter is worse than
+        # none: the plugin would answer "I see no <whole sentence> to fight".
+        self.assertEqual(extract_item("there's a troll on us, deal with it"), '')
+        self.assertEqual(extract_item('walk a ring round the mine and kill anything that comes'), '')
+        # Naming several things at once is still a real answer, and stays whole.
+        self.assertEqual(extract_item('deposit the wood, stone and flint'), 'wood, stone and flint')
+
     def test_bounded(self):
         self.assertLessEqual(len(extract_item('craft ' + 'x'*300)), 120)
 
@@ -147,6 +161,20 @@ class JevTests(unittest.TestCase):
         self.assertEqual(body['questions']['action']['type'], 'choice')
         self.assertEqual(set(body['questions']['action']['criteria']), set(ACTIONS))
         self.assertEqual(body['questions']['named']['type'], 'noul')
+
+    @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
+    @patch('urllib.request.urlopen')
+    def test_no_item_is_sent_where_the_plugin_reads_none(self, urlopen):
+        urlopen.return_value.__enter__.return_value.read.return_value = jev_reply('escort')
+        self.assertEqual(Planner().decide('come hunting with us', {})['item'], '')
+
+    @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
+    @patch('urllib.request.urlopen')
+    def test_taking_everything_is_judged_on_the_pick_alone(self, urlopen):
+        # drop_all and pile ignore the item and take the lot by definition, so
+        # requiring a readable one there would only ever refuse a valid order.
+        urlopen.return_value.__enter__.return_value.read.return_value = jev_reply('pile', named=0.99)
+        self.assertEqual(Planner().decide('put all that timber on the floor', {})['action'], 'pile')
 
     @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
     @patch('urllib.request.urlopen')
@@ -264,6 +292,53 @@ class ClaudePlannerTests(unittest.TestCase):
         self.assertEqual(planner.decide('stop', {})['action'], 'stay')
         self.assertEqual(planner.decide('build me a longhouse', {})['action'], 'chat')
         self.assertEqual(planner.mode, 'offline')
+
+
+class PluginContractTests(unittest.TestCase):
+    """The planner writes a decision the C# dispatch has to be able to act on, and
+    nothing but these tests notices when the two drift apart."""
+
+    def dispatch(self):
+        """Every `case` in the decision switch, paired with its body."""
+        source = (ROOT / 'plugin/Companion.cs').read_text()
+        block = source[source.index('string item = Normalize(decision.item);'):]
+        block = block[:block.index('\n            }\n')]
+        chunks = re.split(r'case\s+"([a-z_]+)"\s*:', block)
+        return dict(zip(chunks[1::2], chunks[2::2]))
+
+    def test_every_action_has_somewhere_to_land(self):
+        missing = ACTIONS - set(self.dispatch())
+        self.assertFalse(missing, f'the planner can choose {missing}, which the plugin cannot act on')
+
+    def test_argless_mirrors_the_plugin(self):
+        # Sending an item to an action that ignores it is noise; failing to send one
+        # to an action that reads it is a job that does nothing. Neither is visible
+        # from the Python side alone, so the C# is the source of truth.
+        ignores = {name for name, body in self.dispatch().items() if 'item' not in body}
+        self.assertEqual(ignores & ACTIONS, ARGLESS)
+
+    def test_the_two_call_path_fits_inside_the_plugins_patience(self):
+        # The plugin abandons /decide after 15s. Jev then Anthropic runs back to
+        # back, so their budgets have to fit inside that or he gives up on an
+        # answer that was on its way.
+        source = (ROOT / 'plugin/Companion.cs').read_text()
+        waits = [int(m) for m in re.findall(r'"http://127\.0\.0\.1:8765/decide".*?request\.timeout = (\d+)',
+                                            source, re.S)]
+        self.assertTrue(waits, 'could not find the plugin timeout for /decide')
+        self.assertLess(JEV_TIMEOUT + TALK_TIMEOUT, waits[0])
+        self.assertLess(PLAN_TIMEOUT, waits[0])
+
+
+class RehearsalTests(unittest.TestCase):
+    """The order corpus, run end to end through a real planner over real HTTP."""
+
+    def test_the_corpus_lands_where_it_says(self):
+        spec = importlib.util.spec_from_file_location('rehearse', ROOT / 'scripts/rehearse.py')
+        rehearse = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rehearse)
+        cases, failures = rehearse.rehearse(quiet=True)
+        self.assertGreater(len(cases), 20, 'the corpus should cover more than a handful of orders')
+        self.assertEqual(failures, [])
 
 
 class HeardTests(unittest.TestCase):

@@ -65,6 +65,13 @@ than assuming: a missing `TYPESAFE_API_KEY` silently puts it back on the Claude
 planner, which is correct but is not what someone debugging Jev expects to see.
 `python3 scripts/check-api.py` makes one real request and says the same thing.
 
+**Changing how orders are read? Rehearse it.** `python3 scripts/rehearse.py` runs
+the whole order corpus through a real planner against a stand-in Jev, with no key
+and no spend, and prints what he decided and said for each one. It is the fastest
+way to see the blast radius of a change to `ACTION_CRITERIA`, `extract_item` or the
+confidence floor, and it already runs inside the test suite. If it disagrees with
+the corpus, work out which of the two is wrong before editing either.
+
 **The planner is not required** for direct commands — the plugin answers about
 forty phrases itself. It is only needed for orders that fall through.
 If it will not start, say so and carry on; do not treat it as fatal.
