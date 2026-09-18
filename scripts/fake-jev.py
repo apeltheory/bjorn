@@ -148,7 +148,9 @@ def serve(port, fixtures, quiet=True):
             if faults:
                 self.send_json(422, {'detail': faults}); return
             state = body['state']
-            order = state.get('order') if isinstance(state, dict) else state
+            # The action request carries `order`; the smaller gate request carries
+            # `message`. Either way it is the line someone spoke.
+            order = (state.get('order') or state.get('message')) if isinstance(state, dict) else state
             given = answer_for(order if isinstance(order, str) else json.dumps(state), fixtures)
             if given is None:
                 # Not a refusal the real API would make; it means the corpus has a

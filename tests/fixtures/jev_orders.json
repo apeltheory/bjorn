@@ -9,7 +9,8 @@
     "between the model and the planner, which is exactly what needs finding.",
     "",
     "`direct` marks an order the plugin's own table answers, so Jev is never asked.",
-    "`matches` is a regex fallback for orders not listed literally."
+    "`matches` is a regex fallback for orders not listed literally.",
+    "`unaddressed` marks a line nobody put his name on: the planner gates it on `jev.addressed` before anything else, and silence is the right answer to most of it."
   ],
   "orders": [
     {
@@ -505,18 +506,189 @@
     {
       "matches": ".*",
       "order": "__fallback__",
-      "note": "anything the corpus does not name is treated as talk rather than guessed at",
+      "note": "anything the corpus does not name is treated as talk rather than guessed at, and as not his business when nobody addressed him",
       "jev": {
         "action": {
           "choice": "chat",
           "confidence": 0.8
         },
         "named": 0.5,
-        "tone": "banter"
+        "tone": "banter",
+        "addressed": 0.1
       },
       "expect": {
         "action": "chat",
         "item": ""
+      }
+    },
+    {
+      "order": "take all of that",
+      "note": "chatter that reads like an order. withdraw would raid a chest on a misheard conversation",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.22
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "let's dump this lot and head back",
+      "note": "the most dangerous phrasing there is: pile, from two players talking",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.18
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "I'm going home, see you",
+      "note": "go_home, said about themselves, not to him",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.15
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "just drop it, not worth carrying",
+      "note": "drop, aimed at a friend",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.2
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "anyone seen my axe",
+      "note": "a question, but not one for him",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.3
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "that troll nearly had me",
+      "note": "narrating, not ordering",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.05
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "could you chop some wood for us",
+      "note": "plainly for him, just without his name on it",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.94,
+        "action": {
+          "choice": "chop",
+          "confidence": 0.93
+        },
+        "named": 0.4,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "chop",
+        "item": ""
+      }
+    },
+    {
+      "order": "go and find Aregas",
+      "note": "an unprefixed order naming another player",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.91,
+        "action": {
+          "choice": "goto_player",
+          "confidence": 0.9
+        },
+        "named": 0.97,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "goto_player",
+        "item": "Aregas"
+      }
+    },
+    {
+      "order": "put the wood in the chest would you",
+      "note": "for him and readable, but deposit from an unaddressed line needs 0.9 - this is 0.78, so he lets it go",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.78,
+        "action": {
+          "choice": "deposit",
+          "confidence": 0.95
+        },
+        "named": 0.96,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "stash the wood in the chest for me please",
+      "note": "the same job, and this time it is plainly his to do",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.96,
+        "action": {
+          "choice": "deposit",
+          "confidence": 0.95
+        },
+        "named": 0.96,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "deposit",
+        "item": "wood"
+      }
+    },
+    {
+      "order": "I wonder where copper even comes from",
+      "note": "he knows, but nobody asked him. Chiming in is what makes a companion tiresome",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.72,
+        "action": {
+          "choice": "chat",
+          "confidence": 0.9
+        },
+        "named": 0.5,
+        "tone": "question"
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
       }
     }
   ]

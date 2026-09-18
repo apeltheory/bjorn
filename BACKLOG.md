@@ -39,6 +39,7 @@ starting with `Bjorn, self test`.
 | 23 | A private repo | `github.com/apeltheory/valheim-companion`, secrets and decompiled game source excluded |
 | 25 | Camp awareness across a multi-house base | `learn the camp` surveys via `Piece.GetAllPiecesInRadius`, saves centre and extent; guard patrols the real camp, mending finds a real bench |
 | 26 | Voice — he hears you, replies in text | Plumbing done and tested, then **parked** by decision. See below |
+| 28 | Drop the need to say his name | `ListenUnaddressed` (off by default): every nearby line gets one small Jev question — was this meant for him? — and silence is the answer to almost all of it. Saying his name skips the gate. Moving goods needs 0.90. An overheard line becomes a job or nothing; he never chimes in |
 | 27 | Port the planner to Jev | Jev (TypeSafe System One) picks the action from all forty-five as one `choice` with calibrated confidence; `item` is read off the sentence in Python; Anthropic is called only for `chat`. Dormant without a key: the Claude planner stays the fallback, unchanged |
 | 24 | Ask follow-up questions, accept replies without his name | Ask-and-listen primitive: one player, 25 seconds, one answer, and the answer can only resolve the question asked — it cannot start a job |
 
@@ -77,6 +78,37 @@ had missed:
    given up on answers that were on their way. The budgets are now 5 and 8.
 
 The third is the kind of thing only a rehearsal finds: every unit test passed throughout.
+
+**Listening without his name.** The gate is the part of this port that most needs real-world
+confirmation, because the corpus supplies its own answers. What to watch in the first session
+with `ListenUnaddressed` on:
+
+- Does ordinary chatter really score below 0.70? The corpus assumes 0.05-0.30 for lines like
+  "let's dump this lot and head back", and that guess is the one most likely to be wrong.
+- Does a polite unprefixed order clear it? "could you chop some wood for us" is assumed 0.94.
+- Is 0.70 the right floor at all? Too low and he acts on conversations; too high and the
+  feature does nothing and you go back to saying his name.
+
+An unaddressed line costs two calls when it passes the gate and one when it does not, so watch
+`MAX_JEV_CALLS` on a busy server. That budget wants to become a token or time budget rather
+than a call count before any tick loop is built on top of it.
+
+## Still to do
+
+**Patrol walks into walls.** `NextPost` is the only destination in `Companion.cs` computed
+rather than taken from a real object, so it is the only one that can land inside a wall, a
+cliff or the sea. It keeps the camp centre's height on sloping ground, the ring is sized by
+the furthest outlying build, and the recovery gives up after eight failures — which is one try
+per post, since there are only eight. Grounding each post to terrain and rejecting any that
+lands inside a `Piece` is the fix. Jev cannot help here: it picks from a list, it cannot
+produce a waypoint.
+
+**No running tally of the base.** `Stock` already reads every chest in the surveyed camp and
+counts his pack with them, but it is a live scan: he has to be standing there, the containers
+must be in a loaded zone, and it caps at 40 chests. A saved tally, written on survey and on
+each deposit, would let him answer away from home. That is persistence, not judgement — but
+once it exists, "is our iron running low" is a real `score` question and "which trip matters
+most" a real `choice`.
 
 ## Voice — PARKED
 

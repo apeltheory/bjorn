@@ -5,7 +5,7 @@ import re
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from brain.server import (ACTIONS, ACTION_CRITERIA, ARGLESS, JEV_TIMEOUT, PLAN_TIMEOUT, TALK_TIMEOUT,
+from brain.server import (ACTIONS, ACTION_CRITERIA, ARGLESS, IGNORE, JEV_TIMEOUT, PLAN_TIMEOUT, TALK_TIMEOUT,
                           Heard, Planner, extract_item, offline, validate)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,7 +78,10 @@ class BrainTests(unittest.TestCase):
     def test_every_action_is_a_choice_jev_can_pick(self):
         # The choice criteria ARE the contract now; a new action with no description
         # would be unreachable, and a description with no action unpickable.
-        self.assertEqual(set(ACTION_CRITERIA), set(ACTIONS))
+        # `ignore` is the one action Jev is never offered: it is how the planner drops
+        # an overheard line, not a thing anyone can be asked to do.
+        self.assertEqual(ACTIONS - set(ACTION_CRITERIA), {'ignore'})
+        self.assertNotIn('ignore', ACTION_CRITERIA)
         self.assertTrue(all(ACTION_CRITERIA.values()), 'every action needs a description')
         self.assertLessEqual(len(ACTION_CRITERIA), 255, 'Jev takes at most 255 choices')
 
@@ -159,7 +162,7 @@ class JevTests(unittest.TestCase):
         self.assertEqual(body['model'], 'jev-latest')
         self.assertEqual(body['state'], {'order': 'walk along with me', 'state': {'health': 100}})
         self.assertEqual(body['questions']['action']['type'], 'choice')
-        self.assertEqual(set(body['questions']['action']['criteria']), set(ACTIONS))
+        self.assertEqual(set(body['questions']['action']['criteria']), set(ACTION_CRITERIA))
         self.assertEqual(body['questions']['named']['type'], 'noul')
 
     @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
@@ -292,6 +295,83 @@ class ClaudePlannerTests(unittest.TestCase):
         self.assertEqual(planner.decide('stop', {})['action'], 'stay')
         self.assertEqual(planner.decide('build me a longhouse', {})['action'], 'chat')
         self.assertEqual(planner.mode, 'offline')
+
+
+class GateTests(unittest.TestCase):
+    """Chat nobody put his name on. It either becomes a job or it becomes nothing:
+    he never answers back into a conversation he was not part of."""
+
+    def two_stage(self, urlopen, addressed, action='chop', confidence=0.95, named=0.9):
+        """Answer the gate, then the action, recording what was asked each time."""
+        sent = []
+
+        def answer(request, **_):
+            body = json.loads(request.data)
+            sent.append(body)
+            payload = (json.dumps({'model': 'jev-latest', 'usage': {'input_tokens': 20, 'output_tokens': 2},
+                                   'answers': {'addressed': {'type': 'noul', 'noul': addressed}}}).encode()
+                       if 'addressed' in body['questions'] else jev_reply(action, confidence, named))
+            urlopen.return_value.__enter__.return_value.read.return_value = payload
+            return urlopen.return_value
+        urlopen.side_effect = answer
+        return sent
+
+    @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
+    @patch('urllib.request.urlopen')
+    def test_overheard_chatter_is_let_go_after_one_cheap_question(self, urlopen):
+        sent = self.two_stage(urlopen, addressed=0.12)
+        self.assertEqual(Planner().decide('take all of that', {}, False), dict(IGNORE))
+        # One call, and a small one: the forty-five choices never went over the wire.
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(list(sent[0]['questions']), ['addressed'])
+        self.assertNotIn('action', sent[0]['questions'])
+        self.assertLess(len(json.dumps(sent[0])), len(json.dumps(ACTION_CRITERIA)) / 2)
+
+    @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
+    @patch('urllib.request.urlopen')
+    def test_an_unprefixed_order_still_lands(self, urlopen):
+        sent = self.two_stage(urlopen, addressed=0.95, action='chop')
+        self.assertEqual(Planner().decide('could you chop some wood for us', {}, False)['action'], 'chop')
+        self.assertEqual(len(sent), 2, 'the gate, and then the action')
+
+    @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
+    @patch('urllib.request.urlopen')
+    def test_moving_goods_on_an_overheard_line_needs_near_certainty(self, urlopen):
+        # Sure enough to act on at all, not sure enough to empty a chest over.
+        self.two_stage(urlopen, addressed=0.8, action='deposit')
+        self.assertEqual(Planner().decide('put the wood in the chest', {}, False), dict(IGNORE))
+        self.two_stage(urlopen, addressed=0.97, action='deposit')
+        self.assertEqual(Planner().decide('put the wood in the chest', {}, False)['action'], 'deposit')
+
+    @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
+    @patch('urllib.request.urlopen')
+    def test_the_direct_table_cannot_smuggle_a_chest_raid_past_the_gate(self, urlopen):
+        # "take all" is answered without asking Jev at all, so the gate has to be
+        # consulted before the direct table, not after it.
+        self.two_stage(urlopen, addressed=0.75)
+        self.assertEqual(Planner().decide('take all', {}, False), dict(IGNORE))
+
+    @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
+    @patch('urllib.request.urlopen')
+    def test_he_does_not_chime_in_on_a_conversation(self, urlopen):
+        self.two_stage(urlopen, addressed=0.9, action='chat')
+        self.assertEqual(Planner().decide('I wonder where copper comes from', {}, False), dict(IGNORE))
+
+    @patch.dict(os.environ, {'TYPESAFE_API_KEY': '', 'ANTHROPIC_API_KEY': 'test'})
+    @patch('urllib.request.urlopen')
+    def test_without_jev_nothing_unaddressed_is_ever_acted_on(self, urlopen):
+        # There is no gate without Jev, and no safe way to act on a room of people
+        # talking without one. He goes back to needing his name.
+        self.assertEqual(Planner().decide('take all of that', {}, False), dict(IGNORE))
+        self.assertEqual(urlopen.call_count, 0)
+
+    @patch.dict(os.environ, {'TYPESAFE_API_KEY': 'test', 'ANTHROPIC_API_KEY': ''})
+    @patch('urllib.request.urlopen')
+    def test_saying_his_name_skips_the_gate_entirely(self, urlopen):
+        sent = self.two_stage(urlopen, addressed=0.0, action='chop')
+        self.assertEqual(Planner().decide('go and fell some timber', {})['action'], 'chop')
+        self.assertEqual(len(sent), 1, 'an addressed order never pays for the gate')
+        self.assertIn('action', sent[0]['questions'])
 
 
 class PluginContractTests(unittest.TestCase):

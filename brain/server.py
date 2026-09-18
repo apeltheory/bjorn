@@ -78,7 +78,10 @@ ACTION_CRITERIA = {
     'where_player': 'Report where another player named in the message is. "where is Sven".',
     'chat': 'Nothing above fits, so he answers with words. Questions about Valheim or about the wider world, sums, riddles, jokes, greetings, abuse aimed at him, and anything he cannot do such as building, sailing or portals.',
 }
-ACTIONS = frozenset(ACTION_CRITERIA)
+# `ignore` is the planner's alone: it is how an overheard line that was never meant
+# for him leaves no trace. Jev is never offered it, because it is not a thing to do.
+ACTIONS = frozenset(ACTION_CRITERIA) | {'ignore'}
+IGNORE = {'action': 'ignore', 'reply': '', 'item': ''}
 
 # Emptying a chest or a pack by mistake is the one error that loses real work, so
 # these need a clear pick before they run at all.
@@ -90,8 +93,21 @@ DESTRUCTIVE = {'deposit', 'withdraw', 'drop', 'drop_all', 'pile'}
 ARGLESS = {
     'follow', 'come', 'escort', 'mule', 'haul', 'stay', 'inventory', 'status', 'where', 'scan',
     'self_test', 'survey', 'camp', 'places', 'claim_bed', 'go_to_bed', 'chop', 'mine', 'drop_all',
-    'pile', 'repair', 'feed_fire', 'open_door', 'close_door', 'chat',
+    'pile', 'repair', 'feed_fire', 'open_door', 'close_door', 'chat', 'ignore',
 }
+
+# Stage one, for chat nobody prefixed with his name. Kept deliberately tiny: it runs
+# on every line spoken nearby, where the full forty-five choices would not pay.
+GATE_CRITERIA = {
+    'true': 'Someone is telling Bjorn to do something, or asking Bjorn a question. An instruction '
+            'or request meant for him, even without his name on it.',
+    'false': 'Players are talking to each other, narrating what they are doing, thinking out loud, '
+             'or discussing plans. Nothing is being asked of Bjorn.',
+}
+# Acting on a misheard conversation is worse than missing an order, and worst of all
+# for the actions that move goods, so those need near-certainty before they run on a
+# line nobody addressed to him.
+OVERHEARD_DESTRUCTIVE = 0.9
 
 # The plugin abandons a /decide request after 15 seconds, and the talk path is two
 # calls back to back, so their timeouts have to fit inside that with room to spare.
@@ -269,6 +285,14 @@ TRAIL = {'cost', 'costs', 'need', 'needs', 'take', 'takes', 'require', 'requires
 # Past this many words it is a sentence, not the name of a thing. "wood, stone and
 # flint" is a real answer; "troll on us, deal with it" is the reader giving up.
 MAX_ITEM_WORDS = 5
+# Determiners and prepositions announce a noun, so a verb-looking word after one of
+# these is a thing, not an order: "go to the MINE" is a place, where "go and FIND
+# Aregas" is still the sentence winding up. That is the whole difference between
+# stripping one leading verb and stripping the run of them.
+NOUN_LEAD = {
+    'the', 'a', 'an', 'some', 'any', 'all', 'my', 'your', 'our', 'his', 'her', 'their', 'its',
+    'to', 'at', 'of', 'from', 'into', 'in', 'on', 'with', 'this', 'that', 'these', 'those',
+}
 ADDRESS = re.compile(r'^\s*bjorn\s*[,:]?\s*', re.IGNORECASE)
 # "take the wood out of the chest" names wood, not a chest. The place an order
 # acts on is already decided by the action, so a trailing phrase naming it goes.
@@ -282,15 +306,16 @@ def extract_item(message):
     """The thing named in an order, or '' when nothing in particular was."""
     text = ADDRESS.sub('', message.strip()).rstrip('.!?')
     tokens = [token for token in re.split(r'\s+', text) if token]
-    verb_used = False
+    noun_ahead = False
     start = 0
     for index, token in enumerate(tokens):
         word = token.lower().strip('.,!?;:"\'')
         if word in FILLER:
+            if word in NOUN_LEAD:
+                noun_ahead = True
             start = index + 1
             continue
-        if word in VERBS and not verb_used:
-            verb_used = True
+        if word in VERBS and not noun_ahead:
             start = index + 1
             continue
         break
@@ -312,6 +337,7 @@ class Planner:
         self.jev_limit = int(os.getenv('MAX_JEV_CALLS', '2000'))
         self.jev_calls = 0
         self.floor = float(os.getenv('JEV_MIN_CONFIDENCE', '0.40'))
+        self.gate_floor = float(os.getenv('ADDRESSED_FLOOR', '0.70'))
         self.key = os.getenv('ANTHROPIC_API_KEY', '')
         self.model = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-5')
         self.limit = int(os.getenv('MAX_API_CALLS', '100'))
@@ -361,6 +387,22 @@ class Planner:
         return (action.get('choice', 'chat'), float(action.get('confidence') or 0.0),
                 float(named.get('noul', 1.0) or 0.0), tone.get('choice', 'order'))
 
+    def gate(self, message, state):
+        """Stage one: was this even meant for him? A single yes/no, on a payload small
+        enough to run on every line spoken nearby."""
+        body = {'model': self.jev_model, 'questions': {'addressed': {
+                    'type': 'noul', 'criteria': GATE_CRITERIA,
+                    'instructions': 'Is this chat message aimed at Bjorn, the companion who works for these players?'}},
+                'state': {'message': message, 'companion': 'Bjorn',
+                          'he_is_currently': state.get('task', 'idle')}}
+        request = urllib.request.Request(self.jev_url, data=json.dumps(body).encode(),
+            headers={'Content-Type': 'application/json', 'Accept': 'application/json',
+                     'Authorization': 'Bearer ' + self.jev_key})
+        with urllib.request.urlopen(request, timeout=JEV_TIMEOUT) as response:
+            answers = json.load(response).get('answers') or {}
+        # An unreadable answer means silence, not a guess: he was not spoken to.
+        return float((answers.get('addressed') or {}).get('noul') or 0.0)
+
     def talk(self, message, state, tone):
         """A line of Bjorn, from the only model here that writes sentences."""
         if not self.key or not self.spend(jev=False):
@@ -394,22 +436,36 @@ class Planner:
             text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text)
         return validate(json.loads(text))
 
-    def decide(self, message, state):
+    def decide(self, message, state, addressed=True):
+        """Read one line of chat. `addressed` is false for anything nobody put his
+        name on, which is heard on sufferance: it either becomes a job or it becomes
+        nothing. He never answers back into a conversation he was not part of."""
+        gate = 1.0
+        if not addressed:
+            # No Jev, no gate, and without a gate there is no safe way to act on a
+            # room full of people talking. He goes back to needing his name.
+            if not self.jev_key or not self.spend(jev=True):
+                return dict(IGNORE)
+            gate = self.gate(message, state)
+            if gate < self.gate_floor:
+                return dict(IGNORE)
         # Immediate stop and basic commands work even during API outages.
         direct = offline(message)
         if direct['action'] != 'chat':
+            if direct['action'] in DESTRUCTIVE and gate < OVERHEARD_DESTRUCTIVE:
+                return dict(IGNORE)
             return direct
         if not self.jev_key:
             # No early access yet, or no key set: the planner Claude ran before.
-            if not self.key:
-                return direct
+            if not self.key or not addressed:
+                return direct if addressed else dict(IGNORE)
             if not self.spend(jev=False):
                 return dict(SPENT)
             return self.claude_plan(message, state)
         if not self.spend(jev=True):
-            return dict(SPENT)
+            return dict(IGNORE) if not addressed else dict(SPENT)
         action, confidence, named, tone = self.ask_jev(message, state)
-        if action not in ACTIONS or confidence < self.floor:
+        if action not in ACTION_CRITERIA or confidence < self.floor:
             action = 'chat'
         item = '' if action in ARGLESS else extract_item(message)
         if action in DESTRUCTIVE:
@@ -418,9 +474,15 @@ class Planner:
             # be read off the sentence, he asks rather than guesses. drop_all and
             # pile take everything by definition, so only the pick is checked there.
             unreadable = action not in ARGLESS and named >= 0.5 and not item
-            if confidence < 0.6 or unreadable:
+            if confidence < 0.6 or unreadable or gate < OVERHEARD_DESTRUCTIVE:
+                if not addressed:
+                    return dict(IGNORE)
                 return validate({'action': 'chat', 'item': '', 'reply': 'Name what you want moved. I will not empty the lot on a guess.'})
         if action == 'chat':
+            # Chiming in on a conversation is the thing that makes a companion
+            # tiresome, so an overheard line he cannot act on is simply let go.
+            if not addressed:
+                return dict(IGNORE)
             return validate({'action': 'chat', 'item': '', 'reply': self.talk(message, state, tone)})
         return validate({'action': action, 'item': item, 'reply': reply_for(action)})
 
@@ -511,16 +573,22 @@ def serve(port=8765):
                 return
             if self.path != '/decide':
                 self.send_error(404); return
+            payload = {}
             try:
                 payload = self.body()
                 message, state = payload['message'], payload['state']
+                # Absent means addressed, so an older plugin keeps working unchanged.
+                spoken_to = payload.get('addressed', True)
                 if not isinstance(message, str) or len(message) > 500 or not isinstance(state, dict):
                     raise ValueError('Bad request')
-                result = planner.decide(message, state)
+                if not isinstance(spoken_to, bool):
+                    raise ValueError('Bad request')
+                result = planner.decide(message, state, spoken_to)
             except (ValueError, KeyError, TypeError):
                 self.send_error(400); return
             except Exception:
-                result = {'action': 'chat', 'reply': 'My thoughts falter. I can still heed follow, stay, and inventory.'}
+                result = ({'action': 'chat', 'reply': 'My thoughts falter. I can still heed follow, stay, and inventory.'}
+                          if payload.get('addressed', True) else dict(IGNORE))
             self.reply(result)
 
     print(f'Bjorn listening on 127.0.0.1:{port}; mode={planner.mode}; '

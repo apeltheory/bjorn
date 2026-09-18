@@ -72,6 +72,11 @@ way to see the blast radius of a change to `ACTION_CRITERIA`, `extract_item` or 
 confidence floor, and it already runs inside the test suite. If it disagrees with
 the corpus, work out which of the two is wrong before editing either.
 
+**`ListenUnaddressed` changes what reaches the planner.** With it on, every nearby
+chat line costs a small Jev call, so a quiet planner log does not mean he is broken:
+it means the gate is rejecting chatter, which is its job. What he ignored leaves no
+trace by design.
+
 **The planner is not required** for direct commands — the plugin answers about
 forty phrases itself. It is only needed for orders that fall through.
 If it will not start, say so and carry on; do not treat it as fatal.

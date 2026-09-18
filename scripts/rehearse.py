@@ -42,7 +42,9 @@ def rehearse(quiet=False):
     # A real planner, pointed at the stand-in. No Anthropic key: the talk path has
     # to stand on its canned lines, which is also how it behaves with the budget spent.
     environment = {'TYPESAFE_API_KEY': 'rehearsal', 'TYPESAFE_BASE_URL': f'http://127.0.0.1:{port}',
-                   'ANTHROPIC_API_KEY': '', 'MAX_JEV_CALLS': str(len(cases) + 10)}
+                   'ANTHROPIC_API_KEY': '',
+                   # An unaddressed line costs two calls, the gate and then the action.
+                   'MAX_JEV_CALLS': str(len(cases) * 2 + 10)}
     previous = {name: os.environ.get(name) for name in environment}
     os.environ.update(environment)
     try:
@@ -54,8 +56,9 @@ def rehearse(quiet=False):
         failures = []
         for case in cases:
             order, want = case['order'], case['expect']
+            spoken_to = not case.get('unaddressed')
             try:
-                got = planner.decide(order, state)
+                got = planner.decide(order, state, spoken_to)
             except Exception as error:                      # noqa: BLE001 - reported, not swallowed
                 failures.append((order, f'{type(error).__name__}: {error}'))
                 print(f'  FAIL  {order!r}\n        raised {type(error).__name__}: {error}')
@@ -66,8 +69,9 @@ def rehearse(quiet=False):
                 failures.append((order, '; '.join(wrong)))
                 print(f'  FAIL  {order!r}\n        ' + '\n        '.join(wrong))
             elif not quiet:
-                shown = got['reply'][:48] + ('…' if len(got['reply']) > 48 else '')
-                print(f'  ok    {order[:44]:<44}  {got["action"]:<14} {got["item"][:22]:<22} {shown}')
+                shown = got['reply'][:40] + ('…' if len(got['reply']) > 40 else '')
+                mark = '  ' if spoken_to else ' ~'   # ~ marks a line nobody addressed to him
+                print(f'{mark}ok    {order[:42]:<42}  {got["action"]:<13} {got["item"][:20]:<20} {shown}')
         return cases, failures
     finally:
         server.shutdown()

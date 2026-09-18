@@ -69,6 +69,29 @@ The F8 feature is installed in version 0.1.2 and needs a game restart to load if
 
 Any nearby player can address him. Start the message with `Bjorn` or `bjorn`, followed by a space, comma, or colon. Capitalization does not matter; `Bjornson` is not an address.
 
+### Without his name (opt in)
+
+Set `ListenUnaddressed = true` in the game config and he reads every nearby line,
+but acts on almost none of them. Each unprefixed line costs one small Jev question —
+*was this meant for him?* — and anything below `ADDRESSED_FLOOR` (0.70) is dropped
+without another word. Saying his name still works and skips the question entirely,
+so it stays the fast, certain way to reach him.
+
+Three rules keep it from being a menace:
+
+- **An overheard line becomes a job or it becomes nothing.** He never answers back
+  into a conversation he was not part of, so "I wonder where copper comes from"
+  between two players gets silence, not a lecture.
+- **Moving goods needs near-certainty (0.90).** "Let's dump this lot and head back"
+  reads a great deal like `pile`, and acting on a misheard conversation is the one
+  mistake that costs real work.
+- **A real order outranks a guess.** If he is still thinking about stray chat when
+  someone says his name, the guess is abandoned mid-flight.
+
+It needs a Jev key. Without one there is no gate, and without a gate there is no
+safe way to act on a room full of people talking, so nothing unaddressed is ever
+acted on.
+
 The plugin answers these exact phrases itself, without an API call. Anything else
 addressed to him goes to the planner, which picks one of the same actions.
 
