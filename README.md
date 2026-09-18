@@ -597,9 +597,81 @@ To exercise the Jev path with no key and no spend:
 python3 scripts/rehearse.py
 ```
 
+## Picking this up
+
+This branch (`claude/port-bjorn-to-jev-oj2jk7`) moves the planner to Jev in three
+commits. Read this before running anything.
+
+### What is proven, and what is not
+
+| | State |
+| --- | --- |
+| `brain/server.py` and the scripts | 50 unit tests, 43 rehearsed orders, and the real bridge driven end to end over HTTP |
+| The Jev wire contract | Written from `typesafe-sdk` 0.7.0's own source. **No request has ever reached api.typesafe.ai** |
+| Jev's judgement | Entirely unproven. The corpus supplies its own answers, so nothing here says Jev picks `escort` over `fight` |
+| `plugin/Companion.cs` | **Never compiled.** Written where there is no dotnet, no BepInEx and no Valheim assemblies |
+
+That last row is the one that matters. Braces and parentheses balance, which is not
+a compiler. Twelve edit sites, all in these six places:
+
+- the `listenUnaddressed` config entry, and its field
+- the `overheardPending` field
+- `Receive` — unprefixed chat falls through instead of being dropped
+- `Dispatch` — a real order aborts a pending guess about stray chat
+- `Decide` — takes `addressed`, sends it, stays quiet when false, and only clears the
+  request flags when it is still the current generation
+- the dispatch switch — `case "ignore"`
+
+### Order of operations
+
+1. **Build first.** `./scripts/bjorn.sh build`. Expect to fix compile errors; that is
+   the first real job, and nothing below is meaningful until it passes.
+2. **Set the key**: `python3 scripts/set-key.py`, then `python3 scripts/check-api.py`.
+   It should print `Planner mode: Jev decides, Anthropic speaks` and an action. That is
+   the first request this code has ever made.
+3. **Rehearse** (`python3 scripts/rehearse.py`) — no key, no spend, 43 orders.
+4. **In game, prefixed only.** Leave `ListenUnaddressed` off. Work the plan below,
+   starting with `Bjorn, self test`.
+5. **Then the gate.** Turn `ListenUnaddressed` on and sit in chat with someone.
+6. **Record what Jev actually says** into the `jev` blocks of
+   `tests/fixtures/jev_orders.json`. Anything that then fails the rehearsal is a real
+   disagreement between the model and the planner, which is the point of the corpus.
+
+### Most likely to be wrong, in order
+
+1. **The gate's scores.** The corpus assumes ordinary chatter lands at 0.05–0.30 and a
+   polite unprefixed order at 0.94. If real scores bunch together, `ADDRESSED_FLOOR`
+   (0.70) is the dial, and there may be no setting that separates them — in which case
+   the honest answer is that the feature does not work and the prefix stays.
+2. **The item reader.** Pure Python, no model behind it. Every phrasing it has not met
+   is a possible miss. Add the misses to the corpus.
+3. **`JEV_MIN_CONFIDENCE`** (0.40) assumes the confidences are calibrated. Nobody has
+   seen a real one.
+
+### Known, unfixed, and deliberately not started
+
+Both are written up in `BACKLOG.md` under **Still to do**.
+
+- **Patrol walks into walls.** Root-caused: `NextPost` is the only destination in
+  `Companion.cs` computed rather than taken from a real object, so it is the only one
+  that can land inside a wall or a cliff, and it keeps the camp centre's height on
+  sloping ground. **Deprioritised by the owner — do not spend time here** unless asked.
+  Jev cannot help with it either way: it picks from a list, it cannot produce a waypoint.
+- **No running tally of the base.** `Stock` already reads every chest in the surveyed
+  camp, but as a live scan: he must be standing there, containers must be in a loaded
+  zone, and it caps at 40. A saved tally is persistence work, not judgement work.
+
+### The next Jev idea, not built
+
+Judgement calls on a tick, which would need nearby creatures in the `/decide` state
+payload (`Scan` already computes them) and a local fallback for every question, so an
+API hiccup mid-fight leaves the hardcoded rule standing rather than freezing him. The
+ranked list is in `BACKLOG.md`. Breaking off a losing fight is the one worth doing
+first: it is a hardcoded `health < 30%` today, and `escort` is exempt entirely.
+
 ## Next gameplay test
 
-1. Restart the modded client and check that Bjorn 0.3.0 and Better Networking load without errors.
+1. Restart the modded client and check that Bjorn 0.4.0 and Better Networking load without errors.
 2. Join using the bot account; have another player stand nearby.
 3. Press F8 to enable bot mode and say **`Bjorn, self test`**. One order, six lines back: version, known places, chests and stations around him, tool wear, belly, and whether he can reach the planner. It touches nothing, so it is safe to run first and it turns most failures into a specific line. Then try `inventory`, `status`, `where are you` and `look around`.
 4. Test `follow me`, `come here`, and `stay` on clear ground, then stopping at an obstacle.
@@ -618,6 +690,32 @@ python3 scripts/rehearse.py
 14. **Death.** Let him die somewhere reachable and confirm he walks back to the stone, takes his gear, re-equips, and heads home.
 15. Press F8 during a job: manual movement should work immediately.
 16. Toggle during an AI request: a late response must not resume the old task.
+
+### Jev, once the rest of the plan passes
+
+17. **The planner path.** Say something loose and unlisted, such as `Bjorn, go and fell
+    some timber`. Watch `logs` for the round trip. This is the first order Jev has ever
+    routed; check it landed on `chop` and not something adjacent.
+18. **The neighbours.** The four pairs that used to need a paragraph of prompt to keep
+    apart, and are now one line of choice description each:
+    `come hunting with us` → `escort`, not `fight`.
+    `just dump it here` → `pile`, not `drop_all`.
+    `fetch me some stone` → `bring`, not `withdraw`.
+    `what does a chest need` → `recipe`, not `craft`.
+19. **The chest guard.** `Bjorn, put that lot away` next to a chest. He should ask which
+    things rather than emptying his pack. Then `Bjorn, deposit the wood and stone`, which
+    should go through.
+20. **The item reader.** `Bjorn, craft 20 wood arrows` at a bench (the count must survive),
+    and `Bjorn, take the wood out of the chest` (the chest must not become the item).
+21. **Talk still works.** `Bjorn, where do I find copper?` — Jev routes it to `chat` and
+    Anthropic writes the line. Two calls, and the pair must finish inside the plugin's
+    fifteen seconds.
+22. **The gate**, last, and only once the above is clean. Set `ListenUnaddressed = true`
+    and restart the game. Then, with someone else, hold an ordinary conversation near him
+    containing `let's dump this lot`, `take all of that` and `I'm going home` — he should
+    do nothing and say nothing to all three. Then try `could you chop some wood for us`
+    with his name left off, which should land. Write down what actually happens: this is
+    the part of the port with the least evidence behind it.
 
 ## Sources
 

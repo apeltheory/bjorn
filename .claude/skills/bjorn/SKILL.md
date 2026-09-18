@@ -32,6 +32,19 @@ game stops at the main menu and someone has to join by hand — say so rather th
 Confirm he actually arrived before reporting success: `./scripts/bjorn.sh logs` should show
 world loading, and `Bjorn, self test` in chat is the definitive check.
 
+## Before anything else, on the Jev branch
+
+`plugin/Companion.cs` on `claude/port-bjorn-to-jev-oj2jk7` **has never been compiled** —
+it was written where there is no dotnet and no game assemblies. `./scripts/bjorn.sh build`
+is the first thing to run, and fixing what it says is the first job. Do not stage or
+launch until it passes, and do not report the Jev work as working until it has.
+
+The Python half is tested (50 unit tests, 43 rehearsed orders, the bridge driven end to
+end), so a failure after a clean build is more likely to be in the C# or in Jev's actual
+answers than in the planner.
+
+`README.md` has a **Picking this up** section with the full order of operations.
+
 ## Rules that matter
 
 **Always `status` first.** It is cheap and tells you whether you are about to

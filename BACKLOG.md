@@ -95,7 +95,9 @@ than a call count before any tick loop is built on top of it.
 
 ## Still to do
 
-**Patrol walks into walls.** `NextPost` is the only destination in `Companion.cs` computed
+**Patrol walks into walls — deprioritised, 18 Sep.** The owner does not want time spent
+here for now. Root-caused but deliberately not fixed, and the feature is left in place
+rather than removed. `NextPost` is the only destination in `Companion.cs` computed
 rather than taken from a real object, so it is the only one that can land inside a wall, a
 cliff or the sea. It keeps the camp centre's height on sloping ground, the ring is sized by
 the furthest outlying build, and the recovery gives up after eight failures — which is one try
