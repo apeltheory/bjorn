@@ -39,7 +39,28 @@ starting with `Bjorn, self test`.
 | 23 | A private repo | `github.com/apeltheory/valheim-companion`, secrets and decompiled game source excluded |
 | 25 | Camp awareness across a multi-house base | `learn the camp` surveys via `Piece.GetAllPiecesInRadius`, saves centre and extent; guard patrols the real camp, mending finds a real bench |
 | 26 | Voice — he hears you, replies in text | Plumbing done and tested, then **parked** by decision. See below |
+| 27 | Port the planner to Jev | Jev (TypeSafe System One) picks the action from all forty-five as one `choice` with calibrated confidence; `item` is read off the sentence in Python; Anthropic is called only for `chat`. Dormant without a key: the Claude planner stays the fallback, unchanged |
 | 24 | Ask follow-up questions, accept replies without his name | Ask-and-listen primitive: one player, 25 seconds, one answer, and the answer can only resolve the question asked — it cannot start a job |
+
+## Jev — WAITING ON A KEY
+
+Written and tested against the wire contract in TypeSafe's official Python SDK
+(`typesafe-sdk` 0.7.0: `POST /v1/systemone`, bearer auth, `state` + named `questions`,
+answers carrying `choice`/`noul`/`score` with confidence). **Never run against the
+live API** — early access is waitlisted and there is no key yet.
+
+So the port is deliberately inert. With `TYPESAFE_API_KEY` blank the planner is the
+Claude one it has always been, prompt and all; setting the key is the whole switch.
+What to check on the first real call: that the answer names arrive back as `action`,
+`named` and `tone`, that confidence is calibrated enough for `JEV_MIN_CONFIDENCE` to
+mean anything at 0.40, and that the forty-five choice descriptions actually separate
+the neighbours that used to need a paragraph of prompt — `escort` against `fight`,
+`pile` against `drop_all`, `bring` against `withdraw`, `recipe` against `craft`.
+
+The item reader is the part most likely to be wrong in play. It is pure Python with
+no model behind it, so every phrasing it has not met is a possible miss; `tests/test_brain.py`
+holds the ones it has. A miss shows up as an empty item, and for anything that empties
+a chest or a pack an empty item makes him ask rather than act.
 
 ## Voice — PARKED
 

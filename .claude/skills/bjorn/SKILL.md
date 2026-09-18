@@ -54,11 +54,19 @@ forcing it — do not `kill -9` a running Valheim, it can lose progress. Tell th
 user instead.
 
 **Restart the planner after editing `brain/server.py` or `.env`.** It reads both
-once at startup. `MAX_API_CALLS` also resets on restart, so a restart refills the
-request budget.
+once at startup. `MAX_JEV_CALLS` and `MAX_API_CALLS` also reset on restart, so a
+restart refills both request budgets.
+
+**Two models, and which one answered matters.** Jev picks the action; Anthropic is
+called only when he has to talk. The planner prints its mode on the first line at
+startup — `Jev decides, Anthropic speaks`, `Jev decides, canned replies`,
+`Anthropic decides and speaks (no Jev key)`, or `offline`. Quote that line rather
+than assuming: a missing `TYPESAFE_API_KEY` silently puts it back on the Claude
+planner, which is correct but is not what someone debugging Jev expects to see.
+`python3 scripts/check-api.py` makes one real request and says the same thing.
 
 **The planner is not required** for direct commands — the plugin answers about
-forty phrases itself. It is only needed for orders that fall through to Claude.
+forty phrases itself. It is only needed for orders that fall through.
 If it will not start, say so and carry on; do not treat it as fatal.
 
 ## Checking a change reached the game

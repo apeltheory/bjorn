@@ -1,6 +1,6 @@
 # Bjorn — Valheim companion
 
-Bjorn runs a real Valheim client on a spare machine using its own Steam account. You play on your PC. A C# BepInEx plugin controls his character, and a local Python service uses Anthropic to interpret natural-language orders and provide a grounded Viking personality.
+Bjorn runs a real Valheim client on a spare machine using its own Steam account. You play on your PC. A C# BepInEx plugin controls his character, and a local Python service reads natural-language orders and gives him a grounded Viking personality. Jev, TypeSafe's System One model, picks which of his forty-five actions an order means; Anthropic writes the lines when he has to actually talk. Jev is optional — without a key the planner runs on Anthropic alone, exactly as it did before.
 
 ## Quick start
 
@@ -366,7 +366,39 @@ the budget and a few seconds. Everything he can do himself stays instant and wor
 Every order that no direct command claims is sent to the planner, which reads the
 whole sentence and picks one action. A command only claims an order if it can find
 what was named, so `drop everything and follow me` and `pick a fight with that troll`
-fall through to Claude rather than being answered literally.
+fall through to the planner rather than being answered literally.
+
+### Which model reads it
+
+Jev is a *System One* model: it does not write text at all, it returns typed
+decisions — a pick from a named list, a yes/no probability, a score — each with a
+calibrated confidence. Choosing one of Bjorn's forty-five actions is exactly that
+shape, so when a `TYPESAFE_API_KEY` is set the planner asks Jev three questions in
+one request: which action this is, whether the speaker named anything in
+particular, and what register the message is in.
+
+That leaves the two things Jev cannot do:
+
+- **The item.** Jev returns a choice, never a word, so the thing that was named is
+  read off the sentence in Python (`extract_item`): one leading verb goes, then the
+  words that carry nothing on their own, and what remains is the name. `craft 20
+  wood arrows` keeps its count, `take the wood out of the chest` keeps only the
+  wood, and `eat up` names nothing rather than matching turnip soup.
+- **The talking.** `chat` — questions about Valheim, sums, riddles, insults — still
+  goes to Anthropic, which is now asked only for a line in his voice and never for
+  an action. Without an Anthropic key he falls back to a canned line and keeps
+  working.
+
+Two things are safer than before. A pick below `JEV_MIN_CONFIDENCE` becomes talk
+instead of a guessed job, and the actions that can empty a chest or a pack need both
+a clear pick and, when Jev says the speaker named something, an item actually read
+off the sentence — otherwise he asks. An empty item means *everything*, which is how
+a whole chest gets emptied by mistake.
+
+**None of this has been run against the live Jev API.** It is written to the wire
+contract published in TypeSafe's official Python SDK, and it is dormant until a key
+exists: with `TYPESAFE_API_KEY` blank the planner is byte-for-byte the Claude one it
+has always been.
 
 Item, creature and recipe names are matched with case, spaces and punctuation
 ignored, against the localized name, the raw `$item_torch` token, and the prefab
@@ -390,6 +422,7 @@ Status recorded September 15, 2026:
 | Better Networking | tibijczyk fork 2.3.4 installed; restart and compatibility check pending |
 | Installed Valheim at initial test | l-1.0.12, network version 40, Steam build 25253764 |
 | Anthropic planner | Configured locally; API and live bridge requests succeeded |
+| Jev planner | Code complete, **never run against the live API**: no early-access key yet |
 
 **Verified:** Bjorn 0.1.1 loaded and joined the friend's server with matching network versions. Six Python tests passed. The bridge rejected an invalid token and accepted an authenticated command. A natural-language request through the running planner received an Anthropic response.
 
@@ -404,18 +437,25 @@ Better Networking's package targets an earlier Valheim release. Its documentatio
 The key is already saved locally in `.env`. **Do not paste it into chat, logs, or handoff notes.** To enter or replace it without a text editor:
 
 ```sh
-python3 scripts/set-key.py
+python3 scripts/set-key.py            # the Jev (TypeSafe) planner key
+python3 scripts/set-key.py anthropic  # the Anthropic key he speaks with
 ```
 
-Paste with Ctrl+Shift+V, then press Enter. Input stays invisible. Restart the planner after changing the key or model.
+Paste with Ctrl+Shift+V, then press Enter. Input stays invisible, and setting one key leaves the other alone. Restart the planner after changing a key or model.
 
 The `.env` settings are:
 
+- `TYPESAFE_API_KEY`: private Jev credential. Blank until early access arrives, and everything falls back to Anthropic.
+- `TYPESAFE_MODEL`: defaults to `jev-latest`.
+- `MAX_JEV_CALLS`: defaults to 2000 per planner process. Jev is charged per input token at a small fraction of a frontier call, so this cap is far looser than the Anthropic one.
+- `JEV_MIN_CONFIDENCE`: defaults to `0.40`. Jev returns a calibrated confidence with every pick; below this he treats the order as talk rather than guessing at a job. Chest and pack emptying needs `0.60` regardless.
 - `ANTHROPIC_API_KEY`: private API credential.
 - `ANTHROPIC_MODEL`: configured model, initially `claude-sonnet-5`.
 - `MAX_API_CALLS`: defaults to 100 per planner process. This is a request cap, **not a dollar spending cap**. Failed requests count, and restarting resets it.
 
-The bridge binds to `127.0.0.1:8765` and uses a generated token in `runtime/bridge.token`. It sends addressed orders plus bot health, task, and inventory to Anthropic, not the entire chat stream. Basic commands execute locally without API calls. API timeout is 12 seconds; the plugin waits at most 15 seconds.
+With both keys set, an order that names a job costs one Jev call and nothing else; only `chat` reaches Anthropic. The planner prints which path it is on at startup.
+
+The bridge binds to `127.0.0.1:8765` and uses a generated token in `runtime/bridge.token`. It sends addressed orders plus bot health, task, and inventory to whichever model is answering, not the entire chat stream. Basic commands execute locally without API calls. The Jev timeout is 8 seconds and the Anthropic timeout is 12; the plugin waits at most 15.
 
 Game configuration lives at:
 
@@ -442,16 +482,16 @@ Other than the in-game F8 toggle, edit configuration while the game is closed.
 | --- | --- |
 | `plugin/Companion.cs` | Chat hooks, controls, jobs, item and station actions, F8 toggle, bridge calls |
 | `plugin/Bjorn.csproj` | C# project referencing installed game assemblies |
-| `brain/server.py` | Python standard-library HTTP bridge and Anthropic planner |
-| `tests/test_brain.py` | Offline command, validation, API contract, and call-cap tests |
+| `brain/server.py` | Python standard-library HTTP bridge, Jev action planner, and Anthropic voice |
+| `tests/test_brain.py` | Offline command, validation, item reading, both API contracts, and call-cap tests |
 | `scripts/build.sh` | Compile the plugin |
 | `scripts/prepare.py` | Stage game symlinks, BepInEx, and compiled Bjorn plugin |
 | `scripts/game.sh` | Launch the modded client |
 | `scripts/brain.sh` | Load `.env` and run the planner |
-| `scripts/set-key.py` | Privately save an API key |
+| `scripts/set-key.py` | Privately save the Jev or Anthropic API key |
 | `scripts/set-server.py` | Save the server to join, with the password entered invisibly |
 | `scripts/smoke.py` | Test authentication and a basic order against the running bridge |
-| `scripts/check-api.py` | Make a small direct Anthropic connection test |
+| `scripts/check-api.py` | Make one real planner request and report which model answered |
 | `scripts/check-commands.py` | Static checks on the chat dispatch: unreachable commands, duplicates, truncated chat lines |
 | `scripts/say-to-bjorn.py` | Push a line to Bjorn as if spoken; the seam any speech-to-text plugs into |
 | `scripts/bugs.sh` | Read the reports filed in game with `bug ...` |
@@ -493,7 +533,7 @@ With the planner running:
 python3 scripts/smoke.py
 ```
 
-For a direct API check (uses a small paid API request):
+For a direct API check (uses one small paid request against whichever planner is configured):
 
 ```sh
 python3 scripts/check-api.py
