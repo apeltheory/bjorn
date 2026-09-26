@@ -39,7 +39,78 @@ starting with `Bjorn, self test`.
 | 23 | A private repo | `github.com/apeltheory/valheim-companion`, secrets and decompiled game source excluded |
 | 25 | Camp awareness across a multi-house base | `learn the camp` surveys via `Piece.GetAllPiecesInRadius`, saves centre and extent; guard patrols the real camp, mending finds a real bench |
 | 26 | Voice — he hears you, replies in text | Plumbing done and tested, then **parked** by decision. See below |
+| 28 | Drop the need to say his name | `ListenUnaddressed` (off by default): every nearby line gets one small Jev question — was this meant for him? — and silence is the answer to almost all of it. Saying his name skips the gate. Moving goods needs 0.90. An overheard line becomes a job or nothing; he never chimes in |
+| 27 | Port the planner to Jev | Jev (TypeSafe System One) picks the action from all forty-five as one `choice` with calibrated confidence; `item` is read off the sentence in Python; Anthropic is called only for `chat`. Dormant without a key: the Claude planner stays the fallback, unchanged |
 | 24 | Ask follow-up questions, accept replies without his name | Ask-and-listen primitive: one player, 25 seconds, one answer, and the answer can only resolve the question asked — it cannot start a job |
+
+## Jev — WAITING ON A KEY
+
+Written and tested against the wire contract in TypeSafe's official Python SDK
+(`typesafe-sdk` 0.7.0: `POST /v1/systemone`, bearer auth, `state` + named `questions`,
+answers carrying `choice`/`noul`/`score` with confidence). **Never run against the
+live API** — early access is waitlisted and there is no key yet.
+
+So the port is deliberately inert. With `TYPESAFE_API_KEY` blank the planner is the
+Claude one it has always been, prompt and all; setting the key is the whole switch.
+What to check on the first real call: that the answer names arrive back as `action`,
+`named` and `tone`, that confidence is calibrated enough for `JEV_MIN_CONFIDENCE` to
+mean anything at 0.40, and that the forty-five choice descriptions actually separate
+the neighbours that used to need a paragraph of prompt — `escort` against `fight`,
+`pile` against `drop_all`, `bring` against `withdraw`, `recipe` against `craft`.
+
+The item reader is the part most likely to be wrong in play. It is pure Python with
+no model behind it, so every phrasing it has not met is a possible miss; the corpus in
+`tests/fixtures/jev_orders.json` holds the ones it has. A miss shows up as an empty item,
+and for anything that empties a chest or a pack an empty item makes him ask rather than act.
+
+**Rehearsing without a key.** `scripts/fake-jev.py` stands in for the API and holds the
+planner to the published request contract; `scripts/rehearse.py` runs the corpus through a
+real planner against it. Writing that harness caught three real defects that source review
+had missed:
+
+1. Junk items were sent to the twenty-five actions the plugin dispatches without ever
+   reading `item` — harmless for `escort`, but `fight` and `harvest` do read it, so he
+   would have answered *I see no there's a troll on us, deal with it to fight*.
+2. Whole clauses were accepted as item names. Anything past five words is now treated as
+   the reader having failed, which is safer than a filter that matches nothing.
+3. The talk path is two calls back to back, Jev then Anthropic, and at the old timeouts
+   could take 20 seconds against a plugin that abandons the request at 15. He would have
+   given up on answers that were on their way. The budgets are now 5 and 8.
+
+The third is the kind of thing only a rehearsal finds: every unit test passed throughout.
+
+**Listening without his name.** The gate is the part of this port that most needs real-world
+confirmation, because the corpus supplies its own answers. What to watch in the first session
+with `ListenUnaddressed` on:
+
+- Does ordinary chatter really score below 0.70? The corpus assumes 0.05-0.30 for lines like
+  "let's dump this lot and head back", and that guess is the one most likely to be wrong.
+- Does a polite unprefixed order clear it? "could you chop some wood for us" is assumed 0.94.
+- Is 0.70 the right floor at all? Too low and he acts on conversations; too high and the
+  feature does nothing and you go back to saying his name.
+
+An unaddressed line costs two calls when it passes the gate and one when it does not, so watch
+`MAX_JEV_CALLS` on a busy server. That budget wants to become a token or time budget rather
+than a call count before any tick loop is built on top of it.
+
+## Still to do
+
+**Patrol walks into walls — deprioritised, 18 Sep.** The owner does not want time spent
+here for now. Root-caused but deliberately not fixed, and the feature is left in place
+rather than removed. `NextPost` is the only destination in `Companion.cs` computed
+rather than taken from a real object, so it is the only one that can land inside a wall, a
+cliff or the sea. It keeps the camp centre's height on sloping ground, the ring is sized by
+the furthest outlying build, and the recovery gives up after eight failures — which is one try
+per post, since there are only eight. Grounding each post to terrain and rejecting any that
+lands inside a `Piece` is the fix. Jev cannot help here: it picks from a list, it cannot
+produce a waypoint.
+
+**No running tally of the base.** `Stock` already reads every chest in the surveyed camp and
+counts his pack with them, but it is a live scan: he has to be standing there, the containers
+must be in a loaded zone, and it caps at 40 chests. A saved tally, written on survey and on
+each deposit, would let him answer away from home. That is persistence, not judgement — but
+once it exists, "is our iron running low" is a real `score` question and "which trip matters
+most" a real `choice`.
 
 ## Voice — PARKED
 

@@ -1,6 +1,6 @@
 # Bjorn — Valheim companion
 
-Bjorn runs a real Valheim client on a spare machine using its own Steam account. You play on your PC. A C# BepInEx plugin controls his character, and a local Python service uses Anthropic to interpret natural-language orders and provide a grounded Viking personality.
+Bjorn runs a real Valheim client on a spare machine using its own Steam account. You play on your PC. A C# BepInEx plugin controls his character, and a local Python service reads natural-language orders and gives him a grounded Viking personality. Jev, TypeSafe's System One model, picks which of his forty-five actions an order means; Anthropic writes the lines when he has to actually talk. Jev is optional — without a key the planner runs on Anthropic alone, exactly as it did before.
 
 ## Quick start
 
@@ -68,6 +68,29 @@ The F8 feature is installed in version 0.1.2 and needs a game restart to load if
 ## Talking to Bjorn
 
 Any nearby player can address him. Start the message with `Bjorn` or `bjorn`, followed by a space, comma, or colon. Capitalization does not matter; `Bjornson` is not an address.
+
+### Without his name (opt in)
+
+Set `ListenUnaddressed = true` in the game config and he reads every nearby line,
+but acts on almost none of them. Each unprefixed line costs one small Jev question —
+*was this meant for him?* — and anything below `ADDRESSED_FLOOR` (0.70) is dropped
+without another word. Saying his name still works and skips the question entirely,
+so it stays the fast, certain way to reach him.
+
+Three rules keep it from being a menace:
+
+- **An overheard line becomes a job or it becomes nothing.** He never answers back
+  into a conversation he was not part of, so "I wonder where copper comes from"
+  between two players gets silence, not a lecture.
+- **Moving goods needs near-certainty (0.90).** "Let's dump this lot and head back"
+  reads a great deal like `pile`, and acting on a misheard conversation is the one
+  mistake that costs real work.
+- **A real order outranks a guess.** If he is still thinking about stray chat when
+  someone says his name, the guess is abandoned mid-flight.
+
+It needs a Jev key. Without one there is no gate, and without a gate there is no
+safe way to act on a room full of people talking, so nothing unaddressed is ever
+acted on.
 
 The plugin answers these exact phrases itself, without an API call. Anything else
 addressed to him goes to the planner, which picks one of the same actions.
@@ -366,7 +389,65 @@ the budget and a few seconds. Everything he can do himself stays instant and wor
 Every order that no direct command claims is sent to the planner, which reads the
 whole sentence and picks one action. A command only claims an order if it can find
 what was named, so `drop everything and follow me` and `pick a fight with that troll`
-fall through to Claude rather than being answered literally.
+fall through to the planner rather than being answered literally.
+
+### Which model reads it
+
+Jev is a *System One* model: it does not write text at all, it returns typed
+decisions — a pick from a named list, a yes/no probability, a score — each with a
+calibrated confidence. Choosing one of Bjorn's forty-five actions is exactly that
+shape, so when a `TYPESAFE_API_KEY` is set the planner asks Jev three questions in
+one request: which action this is, whether the speaker named anything in
+particular, and what register the message is in.
+
+That leaves the two things Jev cannot do:
+
+- **The item.** Jev returns a choice, never a word, so the thing that was named is
+  read off the sentence in Python (`extract_item`): one leading verb goes, then the
+  words that carry nothing on their own, and what remains is the name. `craft 20
+  wood arrows` keeps its count, `take the wood out of the chest` keeps only the
+  wood, and `eat up` names nothing rather than matching turnip soup.
+- **The talking.** `chat` — questions about Valheim, sums, riddles, insults — still
+  goes to Anthropic, which is now asked only for a line in his voice and never for
+  an action. Without an Anthropic key he falls back to a canned line and keeps
+  working.
+
+Two things are safer than before. A pick below `JEV_MIN_CONFIDENCE` becomes talk
+instead of a guessed job, and the actions that can empty a chest or a pack need both
+a clear pick and, when Jev says the speaker named something, an item actually read
+off the sentence — otherwise he asks. An empty item means *everything*, which is how
+a whole chest gets emptied by mistake.
+
+**None of this has been run against the live Jev API.** It is written to the wire
+contract published in TypeSafe's official Python SDK, and it is dormant until a key
+exists: with `TYPESAFE_API_KEY` blank the planner is byte-for-byte the Claude one it
+has always been.
+
+### Rehearsing it without a key
+
+`scripts/fake-jev.py` stands in for `api.typesafe.ai`. It cannot imitate Jev's
+judgement, so it does not try: the answers come from a corpus in
+`tests/fixtures/jev_orders.json`, where each order carries the answer Jev is
+*imagined* to give and the decision that should fall out of it. What it does do is
+hold the planner to the published contract — a request missing `state`, or a choice
+with no criteria, or more than 255 of them, comes back 422 exactly as the real API
+would, so a malformed request fails here rather than on the first live call.
+
+```sh
+python3 scripts/rehearse.py          # every order, with what he decided and said
+python3 scripts/rehearse.py --quiet  # failures and the tally only
+```
+
+It drives a real `Planner` over real HTTP and exits non-zero on any surprise, so it
+runs inside the test suite as well. Three real bugs came out of writing it: junk
+items were being sent to the twenty-five actions the plugin runs without reading
+`item`; whole clauses were being accepted as item names, which would have had him
+answer *I see no there's a troll on us, deal with it to fight*; and the two-call
+talk path could take 20 seconds against a plugin that gives up at 15.
+
+When a key does arrive, record the real answers and replace each `jev` block in the
+corpus. Anything that then fails is a genuine disagreement between the model and
+the planner, which is the thing worth finding.
 
 Item, creature and recipe names are matched with case, spaces and punctuation
 ignored, against the localized name, the raw `$item_torch` token, and the prefab
@@ -390,6 +471,7 @@ Status recorded September 15, 2026:
 | Better Networking | tibijczyk fork 2.3.4 installed; restart and compatibility check pending |
 | Installed Valheim at initial test | l-1.0.12, network version 40, Steam build 25253764 |
 | Anthropic planner | Configured locally; API and live bridge requests succeeded |
+| Jev planner | Code complete and rehearsed against a contract-checking stand-in; **never run against the live API**, no early-access key yet |
 
 **Verified:** Bjorn 0.1.1 loaded and joined the friend's server with matching network versions. Six Python tests passed. The bridge rejected an invalid token and accepted an authenticated command. A natural-language request through the running planner received an Anthropic response.
 
@@ -404,18 +486,25 @@ Better Networking's package targets an earlier Valheim release. Its documentatio
 The key is already saved locally in `.env`. **Do not paste it into chat, logs, or handoff notes.** To enter or replace it without a text editor:
 
 ```sh
-python3 scripts/set-key.py
+python3 scripts/set-key.py            # the Jev (TypeSafe) planner key
+python3 scripts/set-key.py anthropic  # the Anthropic key he speaks with
 ```
 
-Paste with Ctrl+Shift+V, then press Enter. Input stays invisible. Restart the planner after changing the key or model.
+Paste with Ctrl+Shift+V, then press Enter. Input stays invisible, and setting one key leaves the other alone. Restart the planner after changing a key or model.
 
 The `.env` settings are:
 
+- `TYPESAFE_API_KEY`: private Jev credential. Blank until early access arrives, and everything falls back to Anthropic.
+- `TYPESAFE_MODEL`: defaults to `jev-latest`.
+- `MAX_JEV_CALLS`: defaults to 2000 per planner process. Jev is charged per input token at a small fraction of a frontier call, so this cap is far looser than the Anthropic one.
+- `JEV_MIN_CONFIDENCE`: defaults to `0.40`. Jev returns a calibrated confidence with every pick; below this he treats the order as talk rather than guessing at a job. Chest and pack emptying needs `0.60` regardless.
 - `ANTHROPIC_API_KEY`: private API credential.
 - `ANTHROPIC_MODEL`: configured model, initially `claude-sonnet-5`.
 - `MAX_API_CALLS`: defaults to 100 per planner process. This is a request cap, **not a dollar spending cap**. Failed requests count, and restarting resets it.
 
-The bridge binds to `127.0.0.1:8765` and uses a generated token in `runtime/bridge.token`. It sends addressed orders plus bot health, task, and inventory to Anthropic, not the entire chat stream. Basic commands execute locally without API calls. API timeout is 12 seconds; the plugin waits at most 15 seconds.
+With both keys set, an order that names a job costs one Jev call and nothing else; only `chat` reaches Anthropic. The planner prints which path it is on at startup.
+
+The bridge binds to `127.0.0.1:8765` and uses a generated token in `runtime/bridge.token`. It sends addressed orders plus bot health, task, and inventory to whichever model is answering, not the entire chat stream. Basic commands execute locally without API calls. The Jev timeout is 8 seconds and the Anthropic timeout is 12; the plugin waits at most 15.
 
 Game configuration lives at:
 
@@ -442,16 +531,19 @@ Other than the in-game F8 toggle, edit configuration while the game is closed.
 | --- | --- |
 | `plugin/Companion.cs` | Chat hooks, controls, jobs, item and station actions, F8 toggle, bridge calls |
 | `plugin/Bjorn.csproj` | C# project referencing installed game assemblies |
-| `brain/server.py` | Python standard-library HTTP bridge and Anthropic planner |
-| `tests/test_brain.py` | Offline command, validation, API contract, and call-cap tests |
+| `brain/server.py` | Python standard-library HTTP bridge, Jev action planner, and Anthropic voice |
+| `tests/test_brain.py` | Offline command, validation, item reading, both API contracts, call caps, and the plugin dispatch contract |
+| `tests/fixtures/jev_orders.json` | The order corpus: what Jev is imagined to answer, and where each order should land |
+| `scripts/fake-jev.py` | Stand-in for `api.typesafe.ai`; enforces the request contract, serves fixture answers |
+| `scripts/rehearse.py` | Run the corpus through a real planner against the stand-in |
 | `scripts/build.sh` | Compile the plugin |
 | `scripts/prepare.py` | Stage game symlinks, BepInEx, and compiled Bjorn plugin |
 | `scripts/game.sh` | Launch the modded client |
 | `scripts/brain.sh` | Load `.env` and run the planner |
-| `scripts/set-key.py` | Privately save an API key |
+| `scripts/set-key.py` | Privately save the Jev or Anthropic API key |
 | `scripts/set-server.py` | Save the server to join, with the password entered invisibly |
 | `scripts/smoke.py` | Test authentication and a basic order against the running bridge |
-| `scripts/check-api.py` | Make a small direct Anthropic connection test |
+| `scripts/check-api.py` | Make one real planner request and report which model answered |
 | `scripts/check-commands.py` | Static checks on the chat dispatch: unreachable commands, duplicates, truncated chat lines |
 | `scripts/say-to-bjorn.py` | Push a line to Bjorn as if spoken; the seam any speech-to-text plugs into |
 | `scripts/bugs.sh` | Read the reports filed in game with `bug ...` |
@@ -493,15 +585,93 @@ With the planner running:
 python3 scripts/smoke.py
 ```
 
-For a direct API check (uses a small paid API request):
+For a direct API check (uses one small paid request against whichever planner is configured):
 
 ```sh
 python3 scripts/check-api.py
 ```
 
+To exercise the Jev path with no key and no spend:
+
+```sh
+python3 scripts/rehearse.py
+```
+
+## Picking this up
+
+This branch (`claude/port-bjorn-to-jev-oj2jk7`) moves the planner to Jev in three
+commits. Read this before running anything.
+
+### What is proven, and what is not
+
+| | State |
+| --- | --- |
+| `brain/server.py` and the scripts | 50 unit tests, 43 rehearsed orders, and the real bridge driven end to end over HTTP |
+| The Jev wire contract | Written from `typesafe-sdk` 0.7.0's own source. **No request has ever reached api.typesafe.ai** |
+| Jev's judgement | Entirely unproven. The corpus supplies its own answers, so nothing here says Jev picks `escort` over `fight` |
+| `plugin/Companion.cs` | **Never compiled.** Written where there is no dotnet, no BepInEx and no Valheim assemblies |
+
+That last row is the one that matters. Braces and parentheses balance, which is not
+a compiler. Twelve edit sites, all in these six places:
+
+- the `listenUnaddressed` config entry, and its field
+- the `overheardPending` field
+- `Receive` — unprefixed chat falls through instead of being dropped
+- `Dispatch` — a real order aborts a pending guess about stray chat
+- `Decide` — takes `addressed`, sends it, stays quiet when false, and only clears the
+  request flags when it is still the current generation
+- the dispatch switch — `case "ignore"`
+
+### Order of operations
+
+1. **Build first.** `./scripts/bjorn.sh build`. Expect to fix compile errors; that is
+   the first real job, and nothing below is meaningful until it passes.
+2. **Set the key**: `python3 scripts/set-key.py`, then `python3 scripts/check-api.py`.
+   It should print `Planner mode: Jev decides, Anthropic speaks` and an action. That is
+   the first request this code has ever made.
+3. **Rehearse** (`python3 scripts/rehearse.py`) — no key, no spend, 43 orders.
+4. **In game, prefixed only.** Leave `ListenUnaddressed` off. Work the plan below,
+   starting with `Bjorn, self test`.
+5. **Then the gate.** Turn `ListenUnaddressed` on and sit in chat with someone.
+6. **Record what Jev actually says** into the `jev` blocks of
+   `tests/fixtures/jev_orders.json`. Anything that then fails the rehearsal is a real
+   disagreement between the model and the planner, which is the point of the corpus.
+
+### Most likely to be wrong, in order
+
+1. **The gate's scores.** The corpus assumes ordinary chatter lands at 0.05–0.30 and a
+   polite unprefixed order at 0.94. If real scores bunch together, `ADDRESSED_FLOOR`
+   (0.70) is the dial, and there may be no setting that separates them — in which case
+   the honest answer is that the feature does not work and the prefix stays.
+2. **The item reader.** Pure Python, no model behind it. Every phrasing it has not met
+   is a possible miss. Add the misses to the corpus.
+3. **`JEV_MIN_CONFIDENCE`** (0.40) assumes the confidences are calibrated. Nobody has
+   seen a real one.
+
+### Known, unfixed, and deliberately not started
+
+Both are written up in `BACKLOG.md` under **Still to do**.
+
+- **Patrol walks into walls.** Root-caused: `NextPost` is the only destination in
+  `Companion.cs` computed rather than taken from a real object, so it is the only one
+  that can land inside a wall or a cliff, and it keeps the camp centre's height on
+  sloping ground. **Deprioritised by the owner — do not spend time here** unless asked.
+  Jev cannot help with it either way: it picks from a list, it cannot produce a waypoint.
+- **No running tally of the base.** `Stock` already reads every chest in the surveyed
+  camp, but as a live scan: he must be standing there, containers must be in a loaded
+  zone, and it caps at 40. A saved tally is persistence work, not judgement work.
+
+### The next Jev idea, not built
+
+Judgement calls on a tick, which would need nearby creatures in the `/decide` state
+payload (`Scan` already computes them) and a local fallback for every question, so an
+API hiccup mid-fight leaves the hardcoded rule standing rather than freezing him. The
+ranked list is in `BACKLOG.md`. Breaking off a losing fight is the one worth doing
+first: it is a hardcoded `health < 30%` today, and `escort` is exempt entirely.
+
 ## Next gameplay test
 
-1. Restart the modded client and check that Bjorn 0.3.0 and Better Networking load without errors.
+1. Restart the modded client and check that Bjorn 0.4.0 and Better Networking load without errors.
 2. Join using the bot account; have another player stand nearby.
 3. Press F8 to enable bot mode and say **`Bjorn, self test`**. One order, six lines back: version, known places, chests and stations around him, tool wear, belly, and whether he can reach the planner. It touches nothing, so it is safe to run first and it turns most failures into a specific line. Then try `inventory`, `status`, `where are you` and `look around`.
 4. Test `follow me`, `come here`, and `stay` on clear ground, then stopping at an obstacle.
@@ -520,6 +690,32 @@ python3 scripts/check-api.py
 14. **Death.** Let him die somewhere reachable and confirm he walks back to the stone, takes his gear, re-equips, and heads home.
 15. Press F8 during a job: manual movement should work immediately.
 16. Toggle during an AI request: a late response must not resume the old task.
+
+### Jev, once the rest of the plan passes
+
+17. **The planner path.** Say something loose and unlisted, such as `Bjorn, go and fell
+    some timber`. Watch `logs` for the round trip. This is the first order Jev has ever
+    routed; check it landed on `chop` and not something adjacent.
+18. **The neighbours.** The four pairs that used to need a paragraph of prompt to keep
+    apart, and are now one line of choice description each:
+    `come hunting with us` → `escort`, not `fight`.
+    `just dump it here` → `pile`, not `drop_all`.
+    `fetch me some stone` → `bring`, not `withdraw`.
+    `what does a chest need` → `recipe`, not `craft`.
+19. **The chest guard.** `Bjorn, put that lot away` next to a chest. He should ask which
+    things rather than emptying his pack. Then `Bjorn, deposit the wood and stone`, which
+    should go through.
+20. **The item reader.** `Bjorn, craft 20 wood arrows` at a bench (the count must survive),
+    and `Bjorn, take the wood out of the chest` (the chest must not become the item).
+21. **Talk still works.** `Bjorn, where do I find copper?` — Jev routes it to `chat` and
+    Anthropic writes the line. Two calls, and the pair must finish inside the plugin's
+    fifteen seconds.
+22. **The gate**, last, and only once the above is clean. Set `ListenUnaddressed = true`
+    and restart the game. Then, with someone else, hold an ordinary conversation near him
+    containing `let's dump this lot`, `take all of that` and `I'm going home` — he should
+    do nothing and say nothing to all three. Then try `could you chop some wood for us`
+    with his name left off, which should land. Write down what actually happens: this is
+    the part of the port with the least evidence behind it.
 
 ## Sources
 

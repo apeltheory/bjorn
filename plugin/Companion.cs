@@ -52,6 +52,7 @@ public class Companion : BaseUnityPlugin {
     float campSpan;
     bool campKnown;
     ConfigEntry<float> jobRadius, jobMinutes, guardRadius;
+    ConfigEntry<bool> listenUnaddressed;
     ConfigEntry<bool> botEnabled, defendSelf, pileOver, listen;
     ConfigEntry<KeyboardShortcut> toggleKey;
     UnityWebRequest pendingRequest;
@@ -86,6 +87,7 @@ public class Companion : BaseUnityPlugin {
     float salvageScan, salvageAt;
     int muled;
     int patrolStep, postsFailed;
+    bool overheardPending;   // the pending planner request is a guess about stray chat
     bool scoring;    // Whether the current breakable counts toward the tally.
 
     float patrolRing, postUntil;
@@ -148,6 +150,7 @@ public class Companion : BaseUnityPlugin {
         campRadius = Config.Bind("Bot", "CampRadius", 30f, "How far the surveyed camp reaches from its centre, in metres.");
         guardRadius = Config.Bind("Bot", "GuardRadius", 30f, "How far from a camp's centre counts as inside it while on guard, in metres (8-120).");
         pileOver = Config.Bind("Bot", "PileWhenNoChest", true, "On a run home, leave anything the chest cannot take on the ground rather than stopping the job. Dropped items persist in Valheim.");
+        listenUnaddressed = Config.Bind("Bot", "ListenUnaddressed", false, "Also read chat that does not start with his name, and act on it only when the planner is sure it was meant for him. Needs a Jev key; without one nothing unaddressed is ever acted on.");
         defendSelf = Config.Bind("Bot", "DefendSelf", true, "Fight back at anything hostile that comes close while doing other work. Guard duty ignores this and always fights.");
         // Derived from where BepInEx actually is, so a checkout anywhere works. An
         // existing config file keeps whatever value it already holds; this is only the
@@ -466,11 +469,16 @@ public class Companion : BaseUnityPlugin {
         bool addressed = text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && text.Length > prefix.Length &&
                          " ,:".IndexOf(text[prefix.Length]) >= 0;
         bool listening = asked && Time.unscaledTime < askedUntil;
+        bool overheard = false;
         if (!addressed && !listening) {
             // A bug report is not an order. It works in manual mode, from any player,
             // and whether or not he can see who spoke.
             if (Reported(text, source ? source.GetComponent<Player>() : null)) return;
-            return;
+            // Without his name on it the line is only a candidate. It goes to the
+            // planner, which asks Jev whether it was meant for him at all, and says
+            // nothing when it was not. One at a time: chatter never queues up.
+            if (!listenUnaddressed.Value || busy || text.Length == 0 || text.Length > 500) return;
+            overheard = true;
         }
         if (!Active) {
             Logger.LogInfo("Addressed order ignored: bot is in manual mode or not spawned.");
@@ -495,6 +503,10 @@ public class Companion : BaseUnityPlugin {
         }
         remoteName = speaker ? null : spokenBy;
         remotePos = spokenAt;
+        // Overheard chat needs a body in the world to answer to. A shout from across
+        // the map is not a conversation he is standing in, and the coroutine would
+        // discard the answer anyway - so do not spend a call finding that out.
+        if (overheard) { if (speaker) StartCoroutine(Decide(text, speaker, ++generation, false)); return; }
         Dispatch(speaker, text, addressed);
     }
     // Spoken orders arrive here from the bridge. They take the identical path to
@@ -547,6 +559,9 @@ public class Companion : BaseUnityPlugin {
         }
         // Everything past this point acts on the world, so it waits its turn behind a
         // pending planner request and behind the order cooldown.
+        // An overheard line is a guess; a line with his name on it is not. Drop the
+        // guess rather than making the real order wait behind it.
+        if (busy && overheardPending) { generation++; pendingRequest?.Abort(); pendingRequest = null; busy = false; overheardPending = false; }
         if (busy || Time.unscaledTime - lastOrder < 2) {
             // Say so rather than going quiet: silence is indistinguishable from not
             // having heard, and prompts the rephrase that blocks the next order too.
@@ -2468,14 +2483,17 @@ public class Companion : BaseUnityPlugin {
         }
     }
     class Heard { public string[] orders; }
-    IEnumerator Decide(string order, Player speaker, int version) {
+    IEnumerator Decide(string order, Player speaker, int version, bool addressed = true) {
         string token;
         try { token = File.ReadAllText(tokenFile.Value).Trim(); }
         catch { Say("My thoughts are quiet. I can still follow, stay, or report inventory."); yield break; }
         busy = true;
-        Say("Give me a moment to think on that.");
+        overheardPending = !addressed;
+        // Announcing that he is thinking about a conversation he was not part of is
+        // exactly the thing that makes a companion tiresome.
+        if (addressed) Say("Give me a moment to think on that.");
         var me = Player.m_localPlayer;
-        var payload = JsonConvert.SerializeObject(new { message = order, state = new {
+        var payload = JsonConvert.SerializeObject(new { message = order, addressed, state = new {
             health = me.GetHealth(), maxHealth = me.GetMaxHealth(),
             stamina = me.GetStamina(), maxStamina = me.GetMaxStamina(),
             task = job.ToString().ToLowerInvariant(),
@@ -2494,8 +2512,10 @@ public class Companion : BaseUnityPlugin {
             request.SetRequestHeader("Authorization", "Bearer " + token);
             request.timeout = 15;
             yield return request.SendWebRequest();
-            pendingRequest = null;
-            busy = false;
+            // Only the current request owns these. A superseded one - aborted because a
+            // real order arrived while he was still guessing about stray chat - must not
+            // clear the flags belonging to the request that replaced it.
+            if (version == generation) { pendingRequest = null; busy = false; overheardPending = false; }
             if (version != generation || !Active || Player.m_localPlayer != me || !speaker) yield break;
             if (request.result != UnityWebRequest.Result.Success) { Say("My thoughts falter. Speak a simple order."); yield break; }
             Decision decision = null;
@@ -2554,6 +2574,7 @@ public class Companion : BaseUnityPlugin {
                 case "open_door": UseDoor(true); break;
                 case "close_door": UseDoor(false); break;
                 case "emote": if (!Emote(item)) Say(decision.reply); break;
+                case "ignore": break;   // overheard, and not meant for him
                 case "chat": Say(decision.reply); break;
             }
         }

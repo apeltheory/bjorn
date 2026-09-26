@@ -32,6 +32,19 @@ game stops at the main menu and someone has to join by hand — say so rather th
 Confirm he actually arrived before reporting success: `./scripts/bjorn.sh logs` should show
 world loading, and `Bjorn, self test` in chat is the definitive check.
 
+## Before anything else, on the Jev branch
+
+`plugin/Companion.cs` on `claude/port-bjorn-to-jev-oj2jk7` **has never been compiled** —
+it was written where there is no dotnet and no game assemblies. `./scripts/bjorn.sh build`
+is the first thing to run, and fixing what it says is the first job. Do not stage or
+launch until it passes, and do not report the Jev work as working until it has.
+
+The Python half is tested (50 unit tests, 43 rehearsed orders, the bridge driven end to
+end), so a failure after a clean build is more likely to be in the C# or in Jev's actual
+answers than in the planner.
+
+`README.md` has a **Picking this up** section with the full order of operations.
+
 ## Rules that matter
 
 **Always `status` first.** It is cheap and tells you whether you are about to
@@ -54,11 +67,31 @@ forcing it — do not `kill -9` a running Valheim, it can lose progress. Tell th
 user instead.
 
 **Restart the planner after editing `brain/server.py` or `.env`.** It reads both
-once at startup. `MAX_API_CALLS` also resets on restart, so a restart refills the
-request budget.
+once at startup. `MAX_JEV_CALLS` and `MAX_API_CALLS` also reset on restart, so a
+restart refills both request budgets.
+
+**Two models, and which one answered matters.** Jev picks the action; Anthropic is
+called only when he has to talk. The planner prints its mode on the first line at
+startup — `Jev decides, Anthropic speaks`, `Jev decides, canned replies`,
+`Anthropic decides and speaks (no Jev key)`, or `offline`. Quote that line rather
+than assuming: a missing `TYPESAFE_API_KEY` silently puts it back on the Claude
+planner, which is correct but is not what someone debugging Jev expects to see.
+`python3 scripts/check-api.py` makes one real request and says the same thing.
+
+**Changing how orders are read? Rehearse it.** `python3 scripts/rehearse.py` runs
+the whole order corpus through a real planner against a stand-in Jev, with no key
+and no spend, and prints what he decided and said for each one. It is the fastest
+way to see the blast radius of a change to `ACTION_CRITERIA`, `extract_item` or the
+confidence floor, and it already runs inside the test suite. If it disagrees with
+the corpus, work out which of the two is wrong before editing either.
+
+**`ListenUnaddressed` changes what reaches the planner.** With it on, every nearby
+chat line costs a small Jev call, so a quiet planner log does not mean he is broken:
+it means the gate is rejecting chatter, which is its job. What he ignored leaves no
+trace by design.
 
 **The planner is not required** for direct commands — the plugin answers about
-forty phrases itself. It is only needed for orders that fall through to Claude.
+forty phrases itself. It is only needed for orders that fall through.
 If it will not start, say so and carry on; do not treat it as fatal.
 
 ## Checking a change reached the game

@@ -1,0 +1,695 @@
+{
+  "_comment": [
+    "Orders the planner has to get right, with the answer Jev is imagined to give and",
+    "the decision that should fall out of it. The `jev` block is NOT a prediction of",
+    "what the real model will say - it is the input to everything downstream, so that",
+    "item reading, the confidence floor, the chest guard and the reply table can be",
+    "tested without a key. When early access arrives, record the real answers and",
+    "replace each `jev` block: anything that then fails is a genuine disagreement",
+    "between the model and the planner, which is exactly what needs finding.",
+    "",
+    "`direct` marks an order the plugin's own table answers, so Jev is never asked.",
+    "`matches` is a regex fallback for orders not listed literally.",
+    "`unaddressed` marks a line nobody put his name on: the planner gates it on `jev.addressed` before anything else, and silence is the right answer to most of it."
+  ],
+  "orders": [
+    {
+      "order": "come hunting with us",
+      "note": "escort, not fight: he joins the speaker's fight rather than picking his own. The plugin ignores `item` here, so none is sent",
+      "jev": {
+        "action": {
+          "choice": "escort",
+          "confidence": 0.91
+        },
+        "named": 0.04,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "escort",
+        "item": ""
+      }
+    },
+    {
+      "order": "there's a troll on us, deal with it",
+      "note": "fight, not escort. The named thing is a whole clause, so it is dropped rather than passed on as a filter the plugin would fail to match",
+      "jev": {
+        "action": {
+          "choice": "fight",
+          "confidence": 0.88
+        },
+        "named": 0.55,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "fight",
+        "item": ""
+      }
+    },
+    {
+      "order": "just dump it here, the chests are full",
+      "note": "pile, not drop_all: materials go down, his tools and food stay on him. The plugin ignores `item` here, so none is sent",
+      "jev": {
+        "action": {
+          "choice": "pile",
+          "confidence": 0.86
+        },
+        "named": 0.05,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "pile",
+        "item": ""
+      }
+    },
+    {
+      "order": "empty your pack out completely, everything",
+      "note": "drop_all, the one that really does strip him. The plugin ignores `item` here, so none is sent",
+      "jev": {
+        "action": {
+          "choice": "drop_all",
+          "confidence": 0.9
+        },
+        "named": 0.03,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "drop_all",
+        "item": ""
+      }
+    },
+    {
+      "order": "fetch me some stone",
+      "note": "bring, not withdraw: he sources it himself rather than raiding a chest",
+      "jev": {
+        "action": {
+          "choice": "bring",
+          "confidence": 0.92
+        },
+        "named": 0.95,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "bring",
+        "item": "stone"
+      }
+    },
+    {
+      "order": "take the wood out of the chest",
+      "note": "withdraw, and the container is not the item",
+      "jev": {
+        "action": {
+          "choice": "withdraw",
+          "confidence": 0.93
+        },
+        "named": 0.96,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "withdraw",
+        "item": "wood"
+      }
+    },
+    {
+      "order": "what does a chest need",
+      "note": "recipe, not craft: he reads the cost out of the game's own data",
+      "jev": {
+        "action": {
+          "choice": "recipe",
+          "confidence": 0.87
+        },
+        "named": 0.9,
+        "tone": "question"
+      },
+      "expect": {
+        "action": "recipe",
+        "item": "chest"
+      }
+    },
+    {
+      "order": "craft 20 wood arrows",
+      "note": "craft, and the count rides along with the name",
+      "jev": {
+        "action": {
+          "choice": "craft",
+          "confidence": 0.96
+        },
+        "named": 0.98,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "craft",
+        "item": "20 wood arrows"
+      }
+    },
+    {
+      "order": "put that lot away",
+      "note": "THE CHEST GUARD. Jev says something was named; nothing can be read off the sentence. He asks instead of emptying everything.",
+      "jev": {
+        "action": {
+          "choice": "deposit",
+          "confidence": 0.82
+        },
+        "named": 0.93,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "chat",
+        "item": ""
+      }
+    },
+    {
+      "order": "deposit the wood and stone",
+      "note": "named and readable, so it goes through with both materials",
+      "jev": {
+        "action": {
+          "choice": "deposit",
+          "confidence": 0.94
+        },
+        "named": 0.97,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "deposit",
+        "item": "wood and stone"
+      }
+    },
+    {
+      "order": "hand over the haul",
+      "note": "\"the haul\" means all of it, not a thing called haul; nothing named, so an empty item is right",
+      "jev": {
+        "action": {
+          "choice": "deposit",
+          "confidence": 0.89
+        },
+        "named": 0.08,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "deposit",
+        "item": ""
+      }
+    },
+    {
+      "order": "sort the chest out",
+      "note": "a destructive pick Jev is only half sure of never runs on a guess",
+      "jev": {
+        "action": {
+          "choice": "deposit",
+          "confidence": 0.51
+        },
+        "named": 0.2,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "chat",
+        "item": ""
+      }
+    },
+    {
+      "order": "do the thing with the stuff",
+      "note": "below the confidence floor, so it becomes talk rather than a wrong job",
+      "jev": {
+        "action": {
+          "choice": "gather",
+          "confidence": 0.19
+        },
+        "named": 0.4,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "chat",
+        "item": ""
+      }
+    },
+    {
+      "order": "go to Aregas",
+      "note": "another player by name, keeping their capitals",
+      "jev": {
+        "action": {
+          "choice": "goto_player",
+          "confidence": 0.93
+        },
+        "named": 0.98,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "goto_player",
+        "item": "Aregas"
+      }
+    },
+    {
+      "order": "stick with Aregas",
+      "jev": {
+        "action": {
+          "choice": "follow_player",
+          "confidence": 0.92
+        },
+        "named": 0.98,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "follow_player",
+        "item": "Aregas"
+      }
+    },
+    {
+      "order": "where is Sven",
+      "jev": {
+        "action": {
+          "choice": "where_player",
+          "confidence": 0.9
+        },
+        "named": 0.97,
+        "tone": "question"
+      },
+      "expect": {
+        "action": "where_player",
+        "item": "Sven"
+      }
+    },
+    {
+      "order": "equip the iron sword",
+      "jev": {
+        "action": {
+          "choice": "equip",
+          "confidence": 0.95
+        },
+        "named": 0.98,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "equip",
+        "item": "iron sword"
+      }
+    },
+    {
+      "order": "eat something warm",
+      "jev": {
+        "action": {
+          "choice": "eat",
+          "confidence": 0.9
+        },
+        "named": 0.5,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "eat",
+        "item": "warm"
+      }
+    },
+    {
+      "order": "put your shield away",
+      "jev": {
+        "action": {
+          "choice": "unequip",
+          "confidence": 0.9
+        },
+        "named": 0.9,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "unequip",
+        "item": "shield"
+      }
+    },
+    {
+      "order": "pick some raspberries",
+      "jev": {
+        "action": {
+          "choice": "harvest",
+          "confidence": 0.93
+        },
+        "named": 0.95,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "harvest",
+        "item": "raspberries"
+      }
+    },
+    {
+      "order": "remember this as the mine",
+      "jev": {
+        "action": {
+          "choice": "remember_home",
+          "confidence": 0.94
+        },
+        "named": 0.96,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "remember_home",
+        "item": "mine"
+      }
+    },
+    {
+      "order": "walk over to the mine",
+      "note": "a saved place, not the digging verb",
+      "jev": {
+        "action": {
+          "choice": "go_home",
+          "confidence": 0.88
+        },
+        "named": 0.9,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "go_home",
+        "item": "mine"
+      }
+    },
+    {
+      "order": "give us a wave",
+      "jev": {
+        "action": {
+          "choice": "emote",
+          "confidence": 0.9
+        },
+        "named": 0.9,
+        "tone": "banter"
+      },
+      "expect": {
+        "action": "emote",
+        "item": "wave"
+      }
+    },
+    {
+      "order": "do we have any deer hide",
+      "jev": {
+        "action": {
+          "choice": "stock",
+          "confidence": 0.89
+        },
+        "named": 0.95,
+        "tone": "question"
+      },
+      "expect": {
+        "action": "stock",
+        "item": "deer hide"
+      }
+    },
+    {
+      "order": "learn the base",
+      "jev": {
+        "action": {
+          "choice": "survey",
+          "confidence": 0.9
+        },
+        "named": 0.3,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "survey",
+        "item": ""
+      },
+      "note": "survey always looks at the base he is standing in, so the plugin ignores `item`"
+    },
+    {
+      "order": "guard the mine",
+      "jev": {
+        "action": {
+          "choice": "guard",
+          "confidence": 0.87
+        },
+        "named": 0.9,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "guard",
+        "item": "mine"
+      },
+      "note": "a named place, not the camp default"
+    },
+    {
+      "order": "walk a ring round the mine and kill anything that comes",
+      "note": "the same order, rambled. Past five words it is a sentence, so he guards the camp rather than hunting for a place called \"ring round the mine and kill...\"",
+      "jev": {
+        "action": {
+          "choice": "guard",
+          "confidence": 0.84
+        },
+        "named": 0.8,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "guard",
+        "item": ""
+      }
+    },
+    {
+      "order": "where do I find copper",
+      "note": "a real question about the world: talk, and the register says so",
+      "jev": {
+        "action": {
+          "choice": "chat",
+          "confidence": 0.94
+        },
+        "named": 0.6,
+        "tone": "question"
+      },
+      "expect": {
+        "action": "chat",
+        "item": ""
+      }
+    },
+    {
+      "order": "you smell of goat, you useless oaf",
+      "note": "abuse. He answers it rather than refusing or apologising.",
+      "jev": {
+        "action": {
+          "choice": "chat",
+          "confidence": 0.96
+        },
+        "named": 0.1,
+        "tone": "abuse"
+      },
+      "expect": {
+        "action": "chat",
+        "item": ""
+      }
+    },
+    {
+      "order": "build us a longhouse over there",
+      "note": "something he genuinely cannot do, so he says so",
+      "jev": {
+        "action": {
+          "choice": "chat",
+          "confidence": 0.91
+        },
+        "named": 0.7,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "chat",
+        "item": ""
+      }
+    },
+    {
+      "order": "stop",
+      "direct": true,
+      "note": "the plugin's own table answers this; Jev is never asked, and must not be",
+      "expect": {
+        "action": "stay",
+        "item": ""
+      }
+    },
+    {
+      "order": "look around",
+      "direct": true,
+      "note": "a report: the game says the real thing, so the planner stays quiet",
+      "expect": {
+        "action": "scan",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "matches": ".*",
+      "order": "__fallback__",
+      "note": "anything the corpus does not name is treated as talk rather than guessed at, and as not his business when nobody addressed him",
+      "jev": {
+        "action": {
+          "choice": "chat",
+          "confidence": 0.8
+        },
+        "named": 0.5,
+        "tone": "banter",
+        "addressed": 0.1
+      },
+      "expect": {
+        "action": "chat",
+        "item": ""
+      }
+    },
+    {
+      "order": "take all of that",
+      "note": "chatter that reads like an order. withdraw would raid a chest on a misheard conversation",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.22
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "let's dump this lot and head back",
+      "note": "the most dangerous phrasing there is: pile, from two players talking",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.18
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "I'm going home, see you",
+      "note": "go_home, said about themselves, not to him",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.15
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "just drop it, not worth carrying",
+      "note": "drop, aimed at a friend",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.2
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "anyone seen my axe",
+      "note": "a question, but not one for him",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.3
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "that troll nearly had me",
+      "note": "narrating, not ordering",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.05
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "could you chop some wood for us",
+      "note": "plainly for him, just without his name on it",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.94,
+        "action": {
+          "choice": "chop",
+          "confidence": 0.93
+        },
+        "named": 0.4,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "chop",
+        "item": ""
+      }
+    },
+    {
+      "order": "go and find Aregas",
+      "note": "an unprefixed order naming another player",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.91,
+        "action": {
+          "choice": "goto_player",
+          "confidence": 0.9
+        },
+        "named": 0.97,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "goto_player",
+        "item": "Aregas"
+      }
+    },
+    {
+      "order": "put the wood in the chest would you",
+      "note": "for him and readable, but deposit from an unaddressed line needs 0.9 - this is 0.78, so he lets it go",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.78,
+        "action": {
+          "choice": "deposit",
+          "confidence": 0.95
+        },
+        "named": 0.96,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    },
+    {
+      "order": "stash the wood in the chest for me please",
+      "note": "the same job, and this time it is plainly his to do",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.96,
+        "action": {
+          "choice": "deposit",
+          "confidence": 0.95
+        },
+        "named": 0.96,
+        "tone": "order"
+      },
+      "expect": {
+        "action": "deposit",
+        "item": "wood"
+      }
+    },
+    {
+      "order": "I wonder where copper even comes from",
+      "note": "he knows, but nobody asked him. Chiming in is what makes a companion tiresome",
+      "unaddressed": true,
+      "jev": {
+        "addressed": 0.72,
+        "action": {
+          "choice": "chat",
+          "confidence": 0.9
+        },
+        "named": 0.5,
+        "tone": "question"
+      },
+      "expect": {
+        "action": "ignore",
+        "item": "",
+        "reply": ""
+      }
+    }
+  ]
+}
